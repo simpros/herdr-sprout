@@ -42,19 +42,22 @@ State:   $HERDR_PLUGIN_STATE_DIR/state.json
 def status() -> int:
     state = load_state()
     rows = []
-    for path, rec in sorted(state["worktrees"].items()):
+    for path, rec in sorted(state.worktrees.items()):
+        steps = rec.steps
+        if not steps:
+            steps_ok = None
+        elif any(s.get("skipped") for s in steps):
+            steps_ok = False
+        else:
+            steps_ok = all(s.get("ok") for s in steps)
         rows.append(
             {
                 "worktree": path,
                 "exists": os.path.exists(path),
-                "key": rec.get("key"),
-                "mode": rec.get("mode"),
-                "database": rec.get("object"),
-                "steps_ok": (
-                    all(s.get("ok") for s in rec.get("steps", []))
-                    if rec.get("steps")
-                    else None
-                ),
+                "key": rec.key,
+                "mode": rec.mode,
+                "database": rec.object,
+                "steps_ok": steps_ok,
             }
         )
     print(json.dumps({"worktrees": rows}, indent=2))
@@ -91,7 +94,7 @@ def hook(event: str) -> int:
                 cfg, secrets, ProvisionRequest(worktree=path, with_steps=True)
             )
         else:
-            tracked = os.path.realpath(path) in load_state()["worktrees"]
+            tracked = os.path.realpath(path) in load_state().worktrees
             if not tracked and not repo_config(cfg, path):
                 log(f"hook removed: {path} not tracked, skipping")
                 return 0

@@ -7,9 +7,14 @@ import os
 import shutil
 
 from sprout_worktree_db.gitutil import git_worktree_paths, run
-from sprout_worktree_db.models import DropPlan
+from sprout_worktree_db.models import DropPlan, PluginState
 from sprout_worktree_db.paths import log, require_admin_url
-from sprout_worktree_db.state import key_from_object, load_state, object_name, save_state
+from sprout_worktree_db.state import (
+    key_from_object,
+    load_state,
+    locked_state,
+    object_name,
+)
 from sprout_worktree_db.sprout import drop_key
 
 
@@ -22,27 +27,28 @@ def live_worktree_paths_for_config(cfg: dict) -> set[str]:
     return live
 
 
-def live_objects_from_state(state: dict, live_paths: set[str]) -> set[str]:
+def live_objects_from_state(
+    state: PluginState, live_paths: set[str]
+) -> set[str]:
     """Object names still claimed by an existing worktree path in state.
 
-    State is the only source of truth for disambiguated keys — never guess
-    from basename alone.
+    State is the only source of truth for object names — never guess from
+    basename alone.
     """
     live: set[str] = set()
-    for path, rec in state.get("worktrees", {}).items():
+    for path, rec in state.worktrees.items():
         real = os.path.realpath(path) if path else ""
         if not (os.path.exists(path) or real in live_paths):
             continue
-        obj = rec.get("object")
-        if obj and str(obj).startswith("sprout_wt_"):
-            live.add(str(obj))
-        elif rec.get("key") and rec.get("mode", "dedicated") != "preview":
-            live.add(object_name(str(rec["key"])))
+        if rec.object and str(rec.object).startswith("sprout_wt_"):
+            live.add(str(rec.object))
+        elif rec.key and rec.mode != "preview":
+            live.add(object_name(rec.key))
     return live
 
 
 def plan_orphans(
-    state: dict,
+    state: PluginState,
     live_paths: set[str],
     postgres_names: list[str] | None = None,
 ) -> list[DropPlan]:
@@ -50,38 +56,37 @@ def plan_orphans(
     plans: list[DropPlan] = []
     seen_objects: set[str] = set()
 
-    for path, rec in list(state.get("worktrees", {}).items()):
+    for path, rec in list(state.worktrees.items()):
         real = os.path.realpath(path) if path else ""
         path_gone = not os.path.exists(path) and real not in live_paths
         if not path_gone:
             continue
-        if rec.get("mode") == "preview":
+        if rec.mode == "preview":
             plans.append(
                 DropPlan(
-                    key=str(rec.get("key") or ""),
-                    object_name=str(rec.get("object") or ""),
+                    key=rec.key,
+                    object_name=rec.object,
                     reason="stale preview state",
                     state_path=path,
                     skip_drop=True,
                 )
             )
             continue
-        key = rec.get("key")
-        if not key:
+        if not rec.key:
             plans.append(
                 DropPlan(
                     key="",
-                    object_name=str(rec.get("object") or ""),
+                    object_name=rec.object,
                     reason="stale state missing key",
                     state_path=path,
                     skip_drop=True,
                 )
             )
             continue
-        obj = str(rec.get("object") or object_name(str(key)))
+        obj = rec.object or object_name(rec.key)
         plans.append(
             DropPlan(
-                key=str(key),
+                key=rec.key,
                 object_name=obj,
                 reason=f"worktree gone ({path})",
                 state_path=path,
@@ -149,7 +154,7 @@ def apply_drop_plans(
 ) -> list[str]:
     """Execute drop plans; return object names that were (or would be) dropped."""
     dropped: list[str] = []
-    state = load_state()
+    forget_paths: list[str] = []
     for plan in plans:
         log(f"gc: {plan.reason} -> {plan.object_name or plan.key}")
         if dry_run:
@@ -166,13 +171,15 @@ def apply_drop_plans(
                 log(f"gc: drop failed for {plan.key}: {exc}")
                 continue
         if plan.state_path:
-            state["worktrees"].pop(plan.state_path, None)
+            forget_paths.append(plan.state_path)
     if not dry_run:
-        # Also forget any state rows whose object was dropped as a postgres orphan.
-        for path, rec in list(state["worktrees"].items()):
-            if rec.get("object") in dropped:
-                state["worktrees"].pop(path, None)
-        save_state(state)
+        with locked_state() as state:
+            for path in forget_paths:
+                state.worktrees.pop(path, None)
+            # Also forget rows whose object was dropped as a postgres orphan.
+            for path, rec in list(state.worktrees.items()):
+                if rec.object in dropped:
+                    state.worktrees.pop(path, None)
     return dropped
 
 

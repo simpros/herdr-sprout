@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "bin" / "sprout-worktree-db"
@@ -17,7 +18,15 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from sprout_worktree_db import envfile, event, gc as gc_mod, state  # noqa: E402
-from sprout_worktree_db.state import normalize_key, object_name, pick_key, stable_suffix  # noqa: E402
+from sprout_worktree_db.models import PluginState, WorktreeRecord  # noqa: E402
+from sprout_worktree_db.state import (  # noqa: E402
+    mint_key,
+    normalize_key,
+    object_name,
+    resolve_key,
+    stable_suffix,
+)
+from sprout_worktree_db import steps as steps_mod  # noqa: E402
 
 
 class NormalizeKeyTest(unittest.TestCase):
@@ -54,27 +63,48 @@ class MergeEnvFileTest(unittest.TestCase):
             self.assertNotIn("PGHOST=old", text)
 
 
-class PickKeyTest(unittest.TestCase):
-    def test_repo_qualified_basename(self):
-        key = pick_key({"worktrees": {}}, "/tmp/feature", {"name": "myapp"})
-        self.assertEqual(key, "myapp-feature")
-
-    def test_stable_collision_suffix(self):
+class MintKeyTest(unittest.TestCase):
+    def test_always_includes_stable_suffix(self):
         with tempfile.TemporaryDirectory() as tmp:
-            holder = Path(tmp) / "holder"
-            holder.mkdir()
             wt = str(Path(tmp) / "feature")
-            state_data = {
-                "worktrees": {
-                    str(holder): {"key": "repo-feature"},
+            key = mint_key(wt, {"name": "myapp"})
+            self.assertEqual(key, f"myapp-feature-{stable_suffix(wt)}")
+            self.assertLessEqual(len(key), 40)
+            # Same path → same key; no collision branching.
+            self.assertEqual(key, mint_key(wt, {"name": "myapp"}))
+
+    def test_distinct_paths_distinct_keys(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = str(Path(tmp) / "a" / "feature")
+            b = str(Path(tmp) / "b" / "feature")
+            Path(a).parent.mkdir(parents=True)
+            Path(b).parent.mkdir(parents=True)
+            self.assertNotEqual(
+                mint_key(a, {"name": "repo"}),
+                mint_key(b, {"name": "repo"}),
+            )
+
+    def test_resolve_prefers_existing_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = str(Path(tmp) / "feature")
+            st = PluginState(
+                worktrees={
+                    wt: WorktreeRecord(
+                        key="legacy-bare-key",
+                        repo="myapp",
+                        mode="dedicated",
+                        object="sprout_wt_legacy_bare_key",
+                        created_at="2020-01-01T00:00:00+00:00",
+                    )
                 }
-            }
-            key = pick_key(state_data, wt, {"name": "repo"})
-            self.assertTrue(key.startswith("repo-feature-"))
-            self.assertEqual(key, f"repo-feature-{stable_suffix(wt)}")
-            # Same path → same suffix across processes / hash seeds.
+            )
             self.assertEqual(
-                key, pick_key(state_data, wt, {"name": "repo"})
+                resolve_key(st, wt, {"name": "myapp"}),
+                "legacy-bare-key",
+            )
+            self.assertEqual(
+                resolve_key(st, wt, {"name": "myapp"}, requested="forced"),
+                "forced",
             )
 
 
@@ -84,25 +114,31 @@ class PlanOrphansTest(unittest.TestCase):
             live = Path(tmp) / "live"
             live.mkdir()
             gone = str(Path(tmp) / "gone")
-            state_data = {
-                "worktrees": {
-                    str(live): {
-                        "key": "app-live",
-                        "object": "sprout_wt_app_live",
-                        "mode": "dedicated",
-                    },
-                    gone: {
-                        "key": "app-gone",
-                        "object": "sprout_wt_app_gone",
-                        "mode": "dedicated",
-                    },
-                    str(Path(tmp) / "preview-gone"): {
-                        "key": "app-prev",
-                        "object": "sprout_shared_pr1",
-                        "mode": "preview",
-                    },
+            state_data = PluginState(
+                worktrees={
+                    str(live): WorktreeRecord(
+                        key="app-live",
+                        repo="app",
+                        mode="dedicated",
+                        object="sprout_wt_app_live",
+                        created_at="",
+                    ),
+                    gone: WorktreeRecord(
+                        key="app-gone",
+                        repo="app",
+                        mode="dedicated",
+                        object="sprout_wt_app_gone",
+                        created_at="",
+                    ),
+                    str(Path(tmp) / "preview-gone"): WorktreeRecord(
+                        key="app-prev",
+                        repo="app",
+                        mode="preview",
+                        object="sprout_shared_pr1",
+                        created_at="",
+                    ),
                 }
-            }
+            )
             live_paths = {os.path.realpath(str(live))}
             postgres = [
                 "sprout_wt_app_live",
@@ -116,7 +152,6 @@ class PlanOrphansTest(unittest.TestCase):
             self.assertIn("sprout_wt_orphan_only", by_obj)
             preview = next(p for p in plans if p.skip_drop and p.state_path)
             self.assertTrue(preview.skip_drop)
-            # Live worktree's DB must not be planned as orphan.
             self.assertNotIn("sprout_wt_app_live", by_obj)
 
     def test_live_objects_from_state_not_basename(self):
@@ -124,20 +159,21 @@ class PlanOrphansTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             wt = Path(tmp) / "feature"
             wt.mkdir()
-            state_data = {
-                "worktrees": {
-                    str(wt): {
-                        "key": "repo-feature-abc12",
-                        "object": "sprout_wt_repo_feature_abc12",
-                        "mode": "dedicated",
-                    }
+            state_data = PluginState(
+                worktrees={
+                    str(wt): WorktreeRecord(
+                        key="repo-feature-abc12",
+                        repo="repo",
+                        mode="dedicated",
+                        object="sprout_wt_repo_feature_abc12",
+                        created_at="",
+                    )
                 }
-            }
+            )
             live = gc_mod.live_objects_from_state(
                 state_data, {os.path.realpath(str(wt))}
             )
             self.assertEqual(live, {"sprout_wt_repo_feature_abc12"})
-            # Basename-only guess would be sprout_wt_feature — must not appear.
             self.assertNotIn("sprout_wt_feature", live)
 
 
@@ -182,6 +218,59 @@ class EventPathTest(unittest.TestCase):
         self.assertIsNone(
             event.resolve_worktree_path(event={}, context={}, env={})
         )
+
+
+class StepsSkipTest(unittest.TestCase):
+    def test_missing_node_modules_is_not_ok(self):
+        results = steps_mod.run_steps(
+            {},
+            {"SPROUT_WORKTREE_ADMIN_URL": "postgres://u:p@h/db"},
+            {"requires_node_modules": True, "steps": [["echo", "hi"]]},
+            "/tmp/nonexistent-worktree-xyz",
+        )
+        self.assertEqual(len(results), 1)
+        self.assertFalse(results[0]["ok"])
+        self.assertIn("skipped", results[0])
+
+
+class DropKeyResolveTest(unittest.TestCase):
+    def test_fail_closed_without_state_or_repo(self):
+        from sprout_worktree_db.provision import _resolve_drop_key
+
+        with self.assertRaises(SystemExit) as ctx:
+            _resolve_drop_key(
+                {"repos": []},
+                PluginState(),
+                "/tmp/ghost-wt",
+                None,
+                None,
+            )
+        self.assertIn("--key", str(ctx.exception))
+
+    def test_remint_when_repo_known(self):
+        from sprout_worktree_db.provision import _resolve_drop_key
+
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = str(Path(tmp) / "feature")
+            Path(wt).mkdir()
+            main = str(Path(tmp) / "main")
+            Path(main).mkdir()
+            cfg = {
+                "repos": [
+                    {
+                        "name": "myapp",
+                        "main_repo": main,
+                        "env_files": [".env"],
+                    }
+                ]
+            }
+            # repo_config matches via worktrees under main — stub it.
+            with mock.patch(
+                "sprout_worktree_db.provision.repo_config",
+                return_value={"name": "myapp", "env_files": [".env"]},
+            ):
+                key = _resolve_drop_key(cfg, PluginState(), wt, None, None)
+            self.assertEqual(key, mint_key(wt, {"name": "myapp"}))
 
 
 class ConfigDirTest(unittest.TestCase):
@@ -232,6 +321,14 @@ class PackageLayoutTest(unittest.TestCase):
             self.assertNotIn("reassert_env_files", src, msg=str(path))
             self.assertNotIn("DEFAULT_SETTLE", src, msg=str(path))
             self.assertNotIn("time.sleep", src, msg=str(path))
+
+    def test_no_expected_on_env_injection(self):
+        from sprout_worktree_db.models import EnvInjection
+
+        self.assertNotIn("expected", EnvInjection.__dataclass_fields__)
+        self.assertNotIn(
+            "shared_with_preview", EnvInjection.__dataclass_fields__
+        )
 
 
 if __name__ == "__main__":

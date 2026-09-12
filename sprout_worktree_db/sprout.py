@@ -91,15 +91,12 @@ def provision_dedicated(
     written = read_env_values(primary, track_keys)
     values = {k: v for k, v in written.items() if k in track_keys}
 
-    expected: dict[Path, dict[str, str]] = {primary: dict(values)}
     for env_file in env_files[1:]:
         merge_env_file(env_file, values)
-        expected[env_file] = dict(values)
 
     return EnvInjection(
         object_name=conn["object_name"],
         env_files=tuple(env_files),
-        expected=expected,
     )
 
 
@@ -152,15 +149,11 @@ def attach_preview(
         ),
     }
     env_files = [Path(worktree) / rel for rel in repo["env_files"]]
-    expected: dict[Path, dict[str, str]] = {}
     for env_file in env_files:
         merge_env_file(env_file, values)
-        expected[env_file] = dict(values)
     return EnvInjection(
         object_name=target["db_name"],
         env_files=tuple(env_files),
-        expected=expected,
-        shared_with_preview=True,
         pr_id=pr,
         preview_url=target.get("hostname"),
     )

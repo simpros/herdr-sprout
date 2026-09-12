@@ -5,12 +5,22 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime, timezone
-from pathlib import Path
 
 from sprout_worktree_db.gitutil import repo_config
-from sprout_worktree_db.models import DropRequest, ProvisionRequest, WorktreeRecord
+from sprout_worktree_db.models import (
+    DropRequest,
+    PluginState,
+    ProvisionRequest,
+    WorktreeRecord,
+)
 from sprout_worktree_db.paths import config_path, log
-from sprout_worktree_db.state import load_state, normalize_key, object_name, pick_key, save_state
+from sprout_worktree_db.state import (
+    claim_key,
+    locked_state,
+    load_state,
+    mint_key,
+    object_name,
+)
 from sprout_worktree_db.steps import run_steps
 from sprout_worktree_db.sprout import attach_preview, drop_key, provision_dedicated
 
@@ -26,8 +36,9 @@ def do_provision(
             f"(add a repos[] entry with matching main_repo to {config_path()})"
         )
 
-    state = load_state()
-    key = req.key or pick_key(state, worktree, repo)
+    key, _previous = claim_key(
+        worktree, repo, mode=req.mode, requested=req.key
+    )
     log(
         f"provision [{req.mode}] worktree={worktree} key={key} repo={repo['name']}"
     )
@@ -50,13 +61,20 @@ def do_provision(
         created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
         env_files=[str(p) for p in injection.env_files],
         steps=steps,
-        shared_with_preview=injection.shared_with_preview,
         pr_id=injection.pr_id,
         preview_url=injection.preview_url,
     )
-    state = load_state()
-    state["worktrees"][worktree] = record.to_dict()
-    save_state(state)
+    with locked_state() as state:
+        claimed = state.worktrees.get(worktree)
+        if claimed and claimed.key != key:
+            raise RuntimeError(
+                f"key claim lost for {worktree}: held {claimed.key!r}, "
+                f"provisioned {key!r}"
+            )
+        if claimed and claimed.created_at:
+            record.created_at = claimed.created_at
+        state.worktrees[worktree] = record
+
     payload = record.to_dict()
     log(
         f"provisioned {injection.object_name} into "
@@ -69,26 +87,21 @@ def do_provision(
 def do_drop(cfg: dict, secrets: dict, req: DropRequest) -> dict:
     state = load_state()
     worktree = os.path.realpath(req.worktree) if req.worktree else None
-    record = state["worktrees"].get(worktree) if worktree else None
-    key = req.key
-    if record:
-        key = record["key"]
-    if not key and worktree:
-        key = normalize_key(Path(worktree).name or "")
-    if not key:
-        raise SystemExit("drop needs --worktree or --key")
-    shared = bool(record and record.get("mode") == "preview")
+    record = state.worktrees.get(worktree) if worktree else None
+
+    key = _resolve_drop_key(cfg, state, worktree, record, req.key)
+    shared = bool(record and record.mode == "preview")
     if shared:
         log(
-            f"worktree {worktree} shares preview DB {record.get('object')}; "
+            f"worktree {worktree} shares preview DB {record.object}; "
             "refusing to drop"
         )
     elif not req.forget_only:
         drop_key(cfg, secrets, key)
         log(f"dropped {object_name(key)}")
     if record and worktree:
-        state["worktrees"].pop(worktree, None)
-        save_state(state)
+        with locked_state() as locked:
+            locked.worktrees.pop(worktree, None)
     print(
         json.dumps(
             {
@@ -101,3 +114,28 @@ def do_drop(cfg: dict, secrets: dict, req: DropRequest) -> dict:
         )
     )
     return {"key": key}
+
+
+def _resolve_drop_key(
+    cfg: dict,
+    state: PluginState,
+    worktree: str | None,
+    record: WorktreeRecord | None,
+    requested: str | None,
+) -> str:
+    """Same identity rules as provision; fail closed without state or --key."""
+    if requested:
+        return requested
+    if record:
+        return record.key
+    if not worktree:
+        raise SystemExit("drop needs --worktree or --key")
+    repo = repo_config(cfg, worktree)
+    if repo:
+        # Honest recovery when state was wiped but path+repo still known:
+        # remint with the same always-suffix rule as provision.
+        return mint_key(worktree, repo)
+    raise SystemExit(
+        f"no state row for {worktree}; pass --key "
+        "(or ensure repo config matches so the slug can be reminted)"
+    )

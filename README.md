@@ -104,16 +104,18 @@ Per-repo entries keyed by `main_repo` path (same idea as `tdi.worktree-setup`):
 - **`auto_provision_on_create`**: when `true`, the `worktree.created` hook runs
   provision (best-effort, no settle/sleep). Default `false` — prefer an ordered
   setup step when another plugin copies `.env` files.
-- **Slug** comes from `{repo}-{worktree-basename}` (sprout grammar: lowercase,
-  `[^a-z0-9-]` → `-`, max 40), with a stable SHA-1 path suffix on collision.
-  Prefer path basenames over branch names so multiple repos can share one Postgres.
-  Object names for GC come from **state**, not basename guesses.
+- **Slug** is always `{repo}-{worktree-basename}-{sha1(realpath)[:5]}`
+  (sprout grammar: lowercase, `[^a-z0-9-]` → `-`, max 40). Re-provision reuses
+  the key already stored in state (so passwords stay stable). Object names for
+  GC come from **state**, not basename guesses. Drop without a state row remints
+  with the same rule when repo config matches, otherwise requires `--key`.
 - **`renames`** map sprout's canonical `PG*` / `DATABASE_URL` keys to app names.
 - **`steps`** run after provision (migrate before bootstrap). Use `"as_admin": true`
   to inject the admin user/password into the renamed `PGUSER`/`PGPASSWORD` keys.
   Optional `admin_env` adds extra env vars for that step only (no hard-coded
   app aliases in the runner). When `requires_node_modules` is true and
-  `node_modules` is missing, steps are skipped with a clear log line.
+  `node_modules` is missing, steps are skipped (`ok: false` + `skipped`) so
+  `status` does not report a false green.
 - Env writes are atomic (temp + rename). Re-provision keeps the existing password.
 
 ### Worktree path (herdr ≥ 0.8)

@@ -16,8 +16,6 @@ class EnvInjection:
 
     object_name: str
     env_files: tuple[Path, ...]
-    expected: dict[Path, dict[str, str]]
-    shared_with_preview: bool = False
     pr_id: int | None = None
     preview_url: str | None = None
 
@@ -31,7 +29,6 @@ class WorktreeRecord:
     created_at: str
     env_files: list[str] = field(default_factory=list)
     steps: list[dict] = field(default_factory=list)
-    shared_with_preview: bool = False
     pr_id: int | None = None
     preview_url: str | None = None
 
@@ -45,8 +42,6 @@ class WorktreeRecord:
             "env_files": list(self.env_files),
             "steps": list(self.steps),
         }
-        if self.shared_with_preview:
-            data["shared_with_preview"] = True
         if self.pr_id is not None:
             data["pr_id"] = self.pr_id
         if self.preview_url is not None:
@@ -63,10 +58,30 @@ class WorktreeRecord:
             created_at=str(data.get("created_at", "")),
             env_files=list(data.get("env_files") or []),
             steps=list(data.get("steps") or []),
-            shared_with_preview=bool(data.get("shared_with_preview")),
             pr_id=data.get("pr_id"),
             preview_url=data.get("preview_url"),
         )
+
+
+@dataclass
+class PluginState:
+    worktrees: dict[str, WorktreeRecord] = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return {
+            "worktrees": {
+                path: rec.to_dict() for path, rec in self.worktrees.items()
+            }
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> PluginState:
+        raw = data.get("worktrees") or {}
+        worktrees: dict[str, WorktreeRecord] = {}
+        for path, rec in raw.items():
+            if isinstance(rec, dict) and rec.get("key"):
+                worktrees[str(path)] = WorktreeRecord.from_dict(rec)
+        return cls(worktrees=worktrees)
 
 
 @dataclass(frozen=True)

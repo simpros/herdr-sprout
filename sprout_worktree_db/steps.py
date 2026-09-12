@@ -24,7 +24,14 @@ def run_steps(cfg: dict, secrets: dict, repo: dict, worktree: str) -> list[dict]
             "steps skipped: node_modules missing "
             "(install deps, then re-run provision)"
         )
-        return [{"step": "all", "ok": True, "skipped": "node_modules missing"}]
+        # Skips are not success — status must not report steps_ok: true.
+        return [
+            {
+                "step": "all",
+                "ok": False,
+                "skipped": "node_modules missing",
+            }
+        ]
     # Repo scripts shell out to `bun` by name; hooks often lack ~/.bun/bin.
     bun_dir = str(Path(bun).parent) if bun else ""
     step_env = clean_env(
