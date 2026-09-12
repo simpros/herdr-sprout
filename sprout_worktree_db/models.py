@@ -183,20 +183,75 @@ class WorktreeRecord:
 
 
 @dataclass(frozen=True)
-class DropLease:
-    """Slug reserved under lock until Postgres drop finishes (or aborts)."""
+class DropReservation:
+    """Exclusive slug reservation while Postgres drop runs (or aborts)."""
 
-    key: str
-    worktree: str | None
+    lease_id: int
+    worktrees: tuple[str, ...]
     object_name: str
     skip_postgres: bool = False
+
+    def to_dict(self) -> dict:
+        return {
+            "lease_id": self.lease_id,
+            "worktrees": list(self.worktrees),
+            "object_name": self.object_name,
+            "skip_postgres": self.skip_postgres,
+        }
+
+    @classmethod
+    def from_dict(cls, key: str, data: dict | str) -> DropReservation:
+        # Legacy: dropping[key] = worktree path string
+        if isinstance(data, str):
+            return cls(
+                lease_id=0,
+                worktrees=(data,) if data else (),
+                object_name="",
+            )
+        if not isinstance(data, dict):
+            raise SystemExit(
+                f"corrupt state.json: dropping[{key!r}] must be an object"
+            )
+        raw_wts = data.get("worktrees") or []
+        if not isinstance(raw_wts, list):
+            raise SystemExit(
+                f"corrupt state.json: dropping[{key!r}].worktrees must be a list"
+            )
+        try:
+            lease_id = int(data.get("lease_id", 0))
+        except (TypeError, ValueError) as exc:
+            raise SystemExit(
+                f"corrupt state.json: dropping[{key!r}].lease_id invalid"
+            ) from exc
+        return cls(
+            lease_id=lease_id,
+            worktrees=tuple(str(p) for p in raw_wts if str(p)),
+            object_name=str(data.get("object_name") or ""),
+            skip_postgres=bool(data.get("skip_postgres")),
+        )
+
+
+@dataclass(frozen=True)
+class DropLease:
+    """Handle returned by begin_drop / reserve — one owner per slug."""
+
+    lease_id: int
+    key: str
+    worktrees: tuple[str, ...]
+    object_name: str
+    skip_postgres: bool = False
+
+    @property
+    def worktree(self) -> str | None:
+        return self.worktrees[0] if self.worktrees else None
 
 
 @dataclass
 class PluginState:
     worktrees: dict[str, WorktreeRecord] = field(default_factory=dict)
-    # key → worktree path (or "") while a drop lease holds the slug
-    dropping: dict[str, str] = field(default_factory=dict)
+    # key → exclusive DropReservation while a drop lease holds the slug
+    dropping: dict[str, DropReservation] = field(default_factory=dict)
+    next_lease_id: int = 1
 
     def to_dict(self) -> dict:
         data: dict = {
@@ -205,7 +260,11 @@ class PluginState:
             }
         }
         if self.dropping:
-            data["dropping"] = dict(self.dropping)
+            data["dropping"] = {
+                key: res.to_dict() for key, res in self.dropping.items()
+            }
+        if self.next_lease_id != 1:
+            data["next_lease_id"] = self.next_lease_id
         return data
 
     @classmethod
@@ -228,8 +287,28 @@ class PluginState:
         raw_drop = data.get("dropping") or {}
         if raw_drop and not isinstance(raw_drop, dict):
             raise SystemExit("corrupt state.json: 'dropping' must be an object")
-        dropping = {str(k): str(v) for k, v in raw_drop.items()}
-        return cls(worktrees=worktrees, dropping=dropping)
+        dropping = {
+            str(k): DropReservation.from_dict(str(k), v)
+            for k, v in raw_drop.items()
+        }
+        # Status is derived from dropping membership — clear stale writes.
+        for rec in worktrees.values():
+            rec.status = "dropping" if rec.key in dropping else "ready"
+        try:
+            next_id = int(data.get("next_lease_id") or 1)
+        except (TypeError, ValueError) as exc:
+            raise SystemExit(
+                "corrupt state.json: next_lease_id must be an integer"
+            ) from exc
+        if next_id < 1:
+            next_id = 1
+        # Advance past any recovered lease ids.
+        for res in dropping.values():
+            if res.lease_id >= next_id:
+                next_id = res.lease_id + 1
+        return cls(
+            worktrees=worktrees, dropping=dropping, next_lease_id=next_id
+        )
 
 
 @dataclass(frozen=True)

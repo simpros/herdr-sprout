@@ -12,7 +12,7 @@ from sprout_worktree_db.gitutil import repo_config
 from sprout_worktree_db.models import DropRequest, PluginConfig, ProvisionRequest
 from sprout_worktree_db.paths import load_config, load_secrets, log
 from sprout_worktree_db.provision import do_drop, do_provision
-from sprout_worktree_db.state import load_state
+from sprout_worktree_db.state import claim_status, load_state
 from sprout_worktree_db.steps import steps_status
 
 _DOC = """Per-herdr-worktree Postgres databases via sprout.
@@ -50,7 +50,7 @@ def status() -> int:
                 "exists": os.path.exists(path),
                 "key": rec.key,
                 "mode": rec.mode,
-                "status": rec.status,
+                "status": claim_status(state, rec),
                 "database": rec.object,
                 "steps_status": steps_status(rec.steps),
             }

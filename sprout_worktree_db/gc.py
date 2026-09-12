@@ -7,15 +7,16 @@ import os
 import shutil
 
 from sprout_worktree_db.gitutil import git_worktree_paths, run
-from sprout_worktree_db.models import DropPlan, PluginConfig, PluginState
+from sprout_worktree_db.models import DropLease, DropPlan, PluginConfig, PluginState
 from sprout_worktree_db.paths import log, require_admin_url
 from sprout_worktree_db.state import (
     abort_drop,
-    begin_drop,
     finish_drop,
     key_from_object,
     load_state,
+    locked_state,
     object_name,
+    reserve_from_plan,
 )
 from sprout_worktree_db.sprout import drop_key
 
@@ -43,12 +44,17 @@ def live_objects_from_state(
         real = os.path.realpath(path) if path else ""
         if not (os.path.exists(path) or real in live_paths):
             continue
+        if rec.key in state.dropping:
+            continue
         if rec.object and str(rec.object).startswith("sprout_wt_"):
             live.add(str(rec.object))
         elif rec.key and rec.mode != "preview":
             live.add(object_name(rec.key))
-    for key in state.dropping:
-        live.add(object_name(key))
+    for key, res in state.dropping.items():
+        if res.object_name and res.object_name.startswith("sprout_wt_"):
+            live.add(res.object_name)
+        else:
+            live.add(object_name(key))
     return live
 
 
@@ -57,11 +63,16 @@ def plan_orphans(
     live_paths: set[str],
     postgres_names: list[str] | None = None,
 ) -> list[DropPlan]:
-    """Pure planning: state rows / postgres names with no live worktree."""
+    """Pure planning: state rows / postgres names with no live worktree.
+
+    Rows / keys already under a drop lease are skipped (exclusive lease).
+    """
     plans: list[DropPlan] = []
     seen_objects: set[str] = set()
 
     for path, rec in list(state.worktrees.items()):
+        if rec.key in state.dropping:
+            continue
         real = os.path.realpath(path) if path else ""
         path_gone = not os.path.exists(path) and real not in live_paths
         if not path_gone:
@@ -112,6 +123,8 @@ def plan_orphans(
             key = key_from_object(obj)
             if not key:
                 continue
+            if key in state.dropping:
+                continue
             plans.append(
                 DropPlan(
                     key=key,
@@ -150,46 +163,35 @@ def list_postgres_worktree_dbs(secrets: dict[str, str]) -> list[str] | None:
     return [line.strip() for line in out.splitlines() if line.strip()]
 
 
-def apply_drop_plans(
-    cfg: PluginConfig,
-    secrets: dict,
-    plans: list[DropPlan],
-    *,
-    dry_run: bool = False,
-) -> list[str]:
-    """Execute drop plans; return object names that were (or would be) dropped.
-
-    For each plan: begin_drop (lease reserves the slug) → Postgres → finish_drop.
-    ``expect_*`` skips when a concurrent re-provision replaced the claim.
-    """
-    dropped: list[str] = []
-    for plan in plans:
-        log(f"gc: {plan.reason} -> {plan.object_name or plan.key}")
-        if dry_run:
-            if not plan.skip_drop and plan.object_name:
-                dropped.append(plan.object_name)
-            continue
-
-        if plan.state_path:
-            lease = begin_drop(
-                cfg,
-                plan.state_path,
-                expect_key=plan.key or None,
-                expect_object=plan.object_name or None,
-            )
+def reserve_orphan_leases(
+    live_paths: set[str],
+    postgres_names: list[str] | None,
+) -> tuple[list[DropPlan], list[tuple[DropPlan, DropLease]]]:
+    """Under one lock: plan orphans and exclusively reserve each slug."""
+    with locked_state() as state:
+        plans = plan_orphans(state, live_paths, postgres_names)
+        reserved: list[tuple[DropPlan, DropLease]] = []
+        for plan in plans:
+            lease = reserve_from_plan(state, plan)
             if lease is None:
                 log(
                     f"gc: skip {plan.object_name or plan.key}; "
-                    "state claim changed under us"
+                    "drop already in progress or claim changed"
                 )
                 continue
-        elif plan.key:
-            lease = begin_drop(cfg, None, requested=plan.key)
-            if lease is None:
-                continue
-        else:
-            continue
+            reserved.append((plan, lease))
+        return plans, reserved
 
+
+def apply_drop_leases(
+    cfg: PluginConfig,
+    secrets: dict,
+    reserved: list[tuple[DropPlan, DropLease]],
+) -> list[str]:
+    """Execute reserved drop leases; return object names that were dropped."""
+    dropped: list[str] = []
+    for plan, lease in reserved:
+        log(f"gc: {plan.reason} -> {plan.object_name or plan.key}")
         try:
             if plan.skip_drop or lease.skip_postgres:
                 finish_drop(lease)
@@ -216,10 +218,17 @@ def apply_drop_plans(
 def gc(cfg: PluginConfig, secrets: dict, dry_run: bool = False) -> int:
     """Drop sprout_wt_* objects with no live worktree behind them."""
     require_admin_url(secrets)
-    state = load_state()
     live_paths = live_worktree_paths_for_config(cfg)
     postgres = list_postgres_worktree_dbs(secrets)
-    plans = plan_orphans(state, live_paths, postgres)
+
+    if dry_run:
+        plans = plan_orphans(load_state(), live_paths, postgres)
+        for plan in plans:
+            log(f"gc: {plan.reason} -> {plan.object_name or plan.key}")
+        dropped: list[str] = []
+    else:
+        plans, reserved = reserve_orphan_leases(live_paths, postgres)
+        dropped = apply_drop_leases(cfg, secrets, reserved)
 
     if postgres is None:
         log(
@@ -227,7 +236,6 @@ def gc(cfg: PluginConfig, secrets: dict, dry_run: bool = False) -> int:
             f"plans={len(plans)}"
         )
 
-    dropped = apply_drop_plans(cfg, secrets, plans, dry_run=dry_run)
     live_objects = sorted(live_objects_from_state(load_state(), live_paths))
     orphans = [
         p.object_name

@@ -80,14 +80,17 @@ def do_drop(cfg: PluginConfig, secrets: dict, req: DropRequest) -> dict:
     """Begin drop lease → Postgres drop → finish (inverse of claim)."""
     worktree = os.path.realpath(req.worktree) if req.worktree else None
     lease = begin_drop(cfg, worktree, requested=req.key)
-    if lease is None:
-        raise SystemExit("drop could not resolve a key")
 
     dropped = False
-    refused = lease.skip_postgres and not req.forget_only
-    if refused:
-        log(f"worktree {worktree} shares preview DB; refusing to drop")
-    elif not req.forget_only and not lease.skip_postgres:
+    skip_postgres = req.forget_only or lease.skip_postgres
+    if skip_postgres:
+        reason = (
+            "leaving shared/preview DB intact"
+            if lease.skip_postgres
+            else "--forget-only"
+        )
+        log(f"forgetting claim for {lease.key}; {reason}")
+    else:
         try:
             drop_key(cfg, secrets, lease.key)
         except Exception:
@@ -103,7 +106,7 @@ def do_drop(cfg: PluginConfig, secrets: dict, req: DropRequest) -> dict:
                 "ok": True,
                 "key": lease.key,
                 "dropped": dropped,
-                "refused_shared_preview": refused,
+                "forgot_only": skip_postgres,
             },
             indent=2,
         )

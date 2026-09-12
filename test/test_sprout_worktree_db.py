@@ -317,7 +317,6 @@ class DropLeaseTest(unittest.TestCase):
                     return_value=_repo("myapp"),
                 ):
                     lease = state.begin_drop(cfg, wt)
-                assert lease is not None
                 self.assertEqual(lease.key, mint_key(wt, _repo("myapp")))
                 self.assertFalse(lease.skip_postgres)
                 self.assertIn(lease.key, state.load_state().dropping)
@@ -346,22 +345,29 @@ class DropLeaseTest(unittest.TestCase):
                 state.save_state(st)
                 cfg = PluginConfig(repos=(_repo("app"),))
                 lease = state.begin_drop(cfg, wt)
-                assert lease is not None
                 self.assertEqual(lease.key, "app-feature-abc12")
                 mid = state.load_state()
                 self.assertEqual(mid.worktrees[wt].status, "dropping")
                 self.assertIn("app-feature-abc12", mid.dropping)
+                self.assertEqual(
+                    mid.dropping["app-feature-abc12"].lease_id, lease.lease_id
+                )
                 # Concurrent claim must fail closed while lease is held.
                 with self.assertRaises(SystemExit) as ctx:
                     state.claim_key(wt, _repo("app"), mode="dedicated")
                 self.assertIn("drop in progress", str(ctx.exception))
+                # Second begin_drop must not mint another lease for the same slug.
+                with self.assertRaises(SystemExit) as ctx2:
+                    state.begin_drop(cfg, wt)
+                self.assertIn("drop in progress", str(ctx2.exception))
                 state.finish_drop(lease)
                 self.assertNotIn(wt, state.load_state().worktrees)
                 self.assertNotIn("app-feature-abc12", state.load_state().dropping)
             finally:
                 del os.environ["HERDR_PLUGIN_STATE_DIR"]
 
-    def test_expect_key_skips_when_claim_changed(self):
+    def test_stale_finish_ignored_after_abort(self):
+        """Exclusive lease: abort then a second owner's finish must not wipe."""
         with tempfile.TemporaryDirectory() as tmp:
             os.environ["HERDR_PLUGIN_STATE_DIR"] = tmp
             try:
@@ -370,27 +376,58 @@ class DropLeaseTest(unittest.TestCase):
                 st = PluginState(
                     worktrees={
                         wt: WorktreeRecord(
-                            key="new-key",
+                            key="app-feature-abc12",
                             repo="app",
                             mode="dedicated",
-                            object="sprout_wt_new_key",
+                            object="sprout_wt_app_feature_abc12",
                             created_at="",
                         )
                     }
                 )
                 state.save_state(st)
                 cfg = PluginConfig(repos=(_repo("app"),))
-                lease = state.begin_drop(
-                    cfg,
-                    wt,
-                    expect_key="old-key",
-                    expect_object="sprout_wt_old",
-                )
-                self.assertIsNone(lease)
+                lease1 = state.begin_drop(cfg, wt)
+                state.abort_drop(lease1)
+                after_abort = state.load_state()
+                self.assertEqual(after_abort.worktrees[wt].status, "ready")
+                self.assertNotIn("app-feature-abc12", after_abort.dropping)
+                # Stale finish from the aborted lease must be a no-op.
+                state.finish_drop(lease1)
                 self.assertIn(wt, state.load_state().worktrees)
-                self.assertEqual(state.load_state().worktrees[wt].status, "ready")
+                # A fresh lease can proceed.
+                lease2 = state.begin_drop(cfg, wt)
+                self.assertNotEqual(lease1.lease_id, lease2.lease_id)
+                state.finish_drop(lease2)
+                self.assertNotIn(wt, state.load_state().worktrees)
             finally:
                 del os.environ["HERDR_PLUGIN_STATE_DIR"]
+
+    def test_plan_skips_dropping_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gone = str(Path(tmp) / "gone")
+            from sprout_worktree_db.models import DropReservation
+
+            st = PluginState(
+                worktrees={
+                    gone: WorktreeRecord(
+                        key="app-gone",
+                        repo="app",
+                        mode="dedicated",
+                        object="sprout_wt_app_gone",
+                        created_at="",
+                        status="dropping",
+                    )
+                },
+                dropping={
+                    "app-gone": DropReservation(
+                        lease_id=1,
+                        worktrees=(gone,),
+                        object_name="sprout_wt_app_gone",
+                    )
+                },
+            )
+            plans = gc_mod.plan_orphans(st, set(), ["sprout_wt_app_gone"])
+            self.assertEqual(plans, [])
 
     def test_abort_restores_ready_claim(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -412,7 +449,6 @@ class DropLeaseTest(unittest.TestCase):
                 state.save_state(st)
                 cfg = PluginConfig(repos=(_repo("app"),))
                 lease = state.begin_drop(cfg, wt)
-                assert lease is not None
                 state.abort_drop(lease)
                 after = state.load_state()
                 self.assertEqual(after.worktrees[wt].status, "ready")
@@ -426,6 +462,8 @@ class DropLeaseTest(unittest.TestCase):
             try:
                 wt = str(Path(tmp) / "feature")
                 Path(wt).mkdir()
+                from sprout_worktree_db.models import DropReservation
+
                 st = PluginState(
                     worktrees={
                         wt: WorktreeRecord(
@@ -437,7 +475,13 @@ class DropLeaseTest(unittest.TestCase):
                             status="dropping",
                         )
                     },
-                    dropping={"app-feature-abc12": wt},
+                    dropping={
+                        "app-feature-abc12": DropReservation(
+                            lease_id=1,
+                            worktrees=(wt,),
+                            object_name="sprout_wt_app_feature_abc12",
+                        )
+                    },
                 )
                 state.save_state(st)
                 with self.assertRaises(RuntimeError) as ctx:

@@ -178,7 +178,8 @@ Herdr actions (from a workspace context): `provision`, `drop`, `gc`, `status`,
 ## Teardown and GC
 
 - `worktree.removed` drops only `sprout_wt_*` objects for dedicated databases.
-- `drop` refuses shared preview databases (`attach-preview` mode) and says so.
+- `drop` on a preview attachment forgets the state claim and leaves the shared
+  preview database intact (same as `--forget-only`).
 - Out-of-band `git worktree remove` emits no herdr event. Schedule `gc`
   (supports `--dry-run`) for orphan cleanup. With `psql` on `PATH`, `gc` also
   scans Postgres for `sprout_wt_*` orphans. Live objects are taken from **state**
