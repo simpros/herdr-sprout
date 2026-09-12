@@ -1,0 +1,1099 @@
+#!/usr/bin/env python3
+"""Per-herdr-worktree Postgres databases via sprout.
+
+Dedicated mode (default): provisions `sprout_wt_<key>` (own DB + login role)
+and injects the connection into the worktree's env files so parallel agents
+stop sharing one dev database.
+
+Preview mode (`attach-preview`): points the worktree at the database that the
+branch's PR/MR preview deployment already uses (`sprout_<slug>_pr<id>`)
+instead of creating a new one.
+
+Modes:
+  hook <created|removed>   driven by the herdr plugin event payload
+  action <provision|…>     herdr action entrypoints (worktree from context)
+  provision                provision + inject for a worktree (explicit path)
+  attach-preview           reuse the PR's preview database
+  drop                     drop the worktree database + role
+  gc [--dry-run]           drop sprout_wt_* objects whose worktree is gone
+  status                   list tracked worktrees and their databases
+
+Config:  $HERDR_PLUGIN_CONFIG_DIR/config.json
+Secrets: $HERDR_PLUGIN_CONFIG_DIR/secrets.env  (mode 0600)
+State:   $HERDR_PLUGIN_STATE_DIR/state.json
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
+from datetime import datetime, timezone
+from pathlib import Path
+
+PLUGIN_ID = "sprout.worktree-db"
+LEGACY_CONFIG_DIR = Path.home() / ".config" / "sprout"
+
+# Bun's SQL client falls back to libpq-style env vars; a worktree env file
+# sourced into the shell once made `drop` fail with "cannot drop the currently
+# open database". Always hand the CLI a clean PG environment.
+PG_ENV_KEYS = (
+    "PGHOST",
+    "PGPORT",
+    "PGUSER",
+    "PGPASSWORD",
+    "PGDATABASE",
+    "PGAPPUSER",
+    "PGAPPPASSWORD",
+    "DATABASE_URL",
+    "PGSERVICE",
+    "PGOPTIONS",
+    "PGSSLMODE",
+)
+
+DEFAULT_SETTLE_SECONDS = 1.5
+
+
+def config_dir() -> Path:
+    if env := os.environ.get("HERDR_PLUGIN_CONFIG_DIR"):
+        return Path(env)
+    return Path.home() / ".config" / "herdr" / "plugins" / "config" / PLUGIN_ID
+
+
+def state_dir() -> Path:
+    if env := os.environ.get("HERDR_PLUGIN_STATE_DIR"):
+        return Path(env)
+    return Path.home() / ".local" / "state" / "herdr" / "plugins" / PLUGIN_ID
+
+
+def config_path() -> Path:
+    primary = config_dir() / "config.json"
+    if primary.exists():
+        return primary
+    legacy = LEGACY_CONFIG_DIR / "worktree-db.json"
+    if legacy.exists():
+        return legacy
+    return primary
+
+
+def secrets_path() -> Path:
+    primary = config_dir() / "secrets.env"
+    if primary.exists():
+        return primary
+    legacy = LEGACY_CONFIG_DIR / "worktree-db.env"
+    if legacy.exists():
+        return legacy
+    return primary
+
+
+def state_path() -> Path:
+    return state_dir() / "state.json"
+
+
+def log_path() -> Path:
+    return state_dir() / "plugin.log"
+
+
+def log(msg: str) -> None:
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    line = f"{stamp} {msg}"
+    print(line, flush=True)
+    try:
+        path = log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
+
+
+def load_config() -> dict:
+    path = config_path()
+    if not path.exists():
+        raise SystemExit(
+            f"missing config {config_dir() / 'config.json'} "
+            f"(see README; herdr plugin config-dir {PLUGIN_ID})"
+        )
+    with path.open() as fh:
+        return json.load(fh)
+
+
+def load_secrets() -> dict[str, str]:
+    out: dict[str, str] = {}
+    path = secrets_path()
+    if not path.exists():
+        return out
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        out[k.strip()] = v.strip()
+    return out
+
+
+def require_admin_url(secrets: dict[str, str]) -> str:
+    url = secrets.get("SPROUT_WORKTREE_ADMIN_URL", "").strip()
+    if not url:
+        raise SystemExit(
+            f"SPROUT_WORKTREE_ADMIN_URL missing in {secrets_path()} "
+            "(CREATEROLE admin DSN required)"
+        )
+    return url
+
+
+def clean_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if k not in PG_ENV_KEYS}
+    if extra:
+        env.update(extra)
+    return env
+
+
+def run(cmd, cwd=None, env=None, timeout=900):
+    res = subprocess.run(
+        cmd,
+        cwd=cwd,
+        env=env or clean_env(),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    return res.returncode, res.stdout.strip(), res.stderr.strip()
+
+
+def git(args: list[str], cwd: str) -> str | None:
+    try:
+        rc, out, _ = run(["git", "-C", cwd, *args], timeout=30)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    return out if rc == 0 else None
+
+
+def main_repo_of(worktree: str) -> str | None:
+    """First `worktree list --porcelain` entry is the main checkout."""
+    porcelain = git(["worktree", "list", "--porcelain"], worktree)
+    if not porcelain:
+        return None
+    for line in porcelain.splitlines():
+        if line.startswith("worktree "):
+            return line[len("worktree ") :].strip()
+    return None
+
+
+def git_worktree_paths(repo_path: str) -> set[str]:
+    porcelain = git(["worktree", "list", "--porcelain"], repo_path)
+    if not porcelain:
+        return set()
+    paths: set[str] = set()
+    for line in porcelain.splitlines():
+        if line.startswith("worktree "):
+            paths.add(os.path.realpath(line[len("worktree ") :].strip()))
+    return paths
+
+
+def branch_of(worktree: str) -> str | None:
+    out = git(["rev-parse", "--abbrev-ref", "HEAD"], worktree)
+    return out.strip() if out else None
+
+
+def normalize_key(raw: str) -> str | None:
+    """Mirror sprout's normalizeWorktreeKey: lowercase, -collapse, max 40."""
+    key = re.sub(r"[^a-z0-9-]+", "-", raw.lower())
+    key = re.sub(r"-+", "-", key).strip("-")
+    if len(key) > 40:
+        key = key[:40].rstrip("-")
+    return key or None
+
+
+def object_name(key: str) -> str:
+    return "sprout_wt_" + key.replace("-", "_")
+
+
+def load_state() -> dict:
+    path = state_path()
+    if not path.exists():
+        legacy = LEGACY_CONFIG_DIR / "worktree-db-state.json"
+        if legacy.exists():
+            path = legacy
+        else:
+            return {"worktrees": {}}
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {"worktrees": {}}
+    data.setdefault("worktrees", {})
+    return data
+
+
+def save_state(state: dict) -> None:
+    path = state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".state-")
+    with os.fdopen(fd, "w") as fh:
+        json.dump(state, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp, path)
+
+
+def repo_config(cfg: dict, worktree: str) -> dict | None:
+    main = main_repo_of(worktree) or ""
+    for repo in cfg.get("repos", []):
+        if main and os.path.realpath(main) == os.path.realpath(
+            os.path.expanduser(repo["main_repo"])
+        ):
+            return repo
+    worktree_real = os.path.realpath(worktree)
+    for repo in cfg.get("repos", []):
+        root = os.path.realpath(os.path.expanduser(repo["main_repo"]))
+        if worktree_real.startswith(root + os.sep):
+            return repo
+        wt_root = repo.get("worktrees_root")
+        if wt_root:
+            wt_root = os.path.realpath(os.path.expanduser(wt_root))
+            if worktree_real == wt_root or worktree_real.startswith(
+                wt_root + os.sep
+            ):
+                return repo
+    return None
+
+
+def pick_key(state: dict, worktree: str, repo: dict) -> str:
+    """Basename-derived key; disambiguate if it belongs to another worktree."""
+    base = normalize_key(Path(worktree).name) or normalize_key(repo["name"])
+    if not base:
+        raise SystemExit(f"cannot derive slug from worktree path: {worktree}")
+    key = base
+    holder = next(
+        (
+            p
+            for p, rec in state["worktrees"].items()
+            if rec.get("key") == key and p != worktree
+        ),
+        None,
+    )
+    if holder and os.path.exists(holder):
+        key = f"{base[:33]}-{abs(hash(worktree)) % 100000:05d}"
+    return key
+
+
+# --- env file handling (mirrors sprout's mergeConnectionEnvFile semantics) ---
+
+
+def merge_env_file(path: Path, values: dict[str, str]) -> None:
+    lines: list[str] = []
+    seen: set[str] = set()
+    if path.exists():
+        for line in path.read_text().splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in line:
+                lines.append(line)
+                continue
+            key = line[: line.index("=")]
+            if key in values:
+                lines.append(f"{key}={values[key]}")
+                seen.add(key)
+            else:
+                lines.append(line)
+    for key, value in values.items():
+        if key not in seen:
+            lines.append(f"{key}={value}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".sprout-env-")
+    with os.fdopen(fd, "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+    os.replace(tmp, path)
+
+
+def read_env_values(path: Path, keys: set[str]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    if not path.exists():
+        return out
+    for line in path.read_text().splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in line:
+            continue
+        key = line[: line.index("=")]
+        if key in keys:
+            out[key] = line[line.index("=") + 1 :]
+    return out
+
+
+def reassert_env_files(
+    env_files: list[Path], expected: dict[str, dict[str, str]], settle: float
+) -> None:
+    """Re-write injected keys if a competing .env copy overwrote them."""
+    if settle <= 0 or not expected:
+        return
+    time.sleep(settle)
+    for path in env_files:
+        want = expected.get(str(path))
+        if not want:
+            continue
+        have = read_env_values(path, set(want))
+        if any(have.get(k) != v for k, v in want.items()):
+            log(f"re-asserting env keys in {path} after settle ({settle}s)")
+            merge_env_file(path, want)
+
+
+# --- sprout CLI ---
+
+
+def resolve_sprout_cli(cfg: dict) -> str:
+    configured = cfg.get("cli")
+    if configured and Path(configured).exists():
+        return configured
+    found = shutil.which("sprout")
+    if found:
+        return found
+    raise SystemExit(
+        "sprout CLI not found (set config.cli or install sprout on PATH; "
+        "glibc hosts may need a source build — see README)"
+    )
+
+
+def sprout_cli(cfg: dict, secrets: dict, args: list[str]) -> tuple[int, str, str]:
+    cmd = [resolve_sprout_cli(cfg), *args]
+    env = clean_env(
+        {
+            "SPROUT_URL": secrets.get("SPROUT_URL", ""),
+            "SPROUT_TOKEN": secrets.get("SPROUT_ADMIN_TOKEN", ""),
+        }
+    )
+    return run(cmd, env=env)
+
+
+def provision_dedicated(cfg, secrets, repo, worktree, key) -> dict:
+    admin_url = require_admin_url(secrets)
+    renames: list[str] = []
+    for logical, target in (repo.get("renames") or {}).items():
+        renames += ["--rename", f"{logical}={target}"]
+    env_files = [Path(worktree) / rel for rel in repo["env_files"]]
+    track_keys = set((repo.get("renames") or {}).values()) | {
+        "PGHOST",
+        "PGPORT",
+        "PGDATABASE",
+        "PGUSER",
+        "PGPASSWORD",
+        "DATABASE_URL",
+    }
+    conn = None
+    expected: dict[str, dict[str, str]] = {}
+    for env_file in env_files:
+        env_file.parent.mkdir(parents=True, exist_ok=True)
+        env_file.touch()
+        rc, out, err = sprout_cli(
+            cfg,
+            secrets,
+            [
+                "worktree-db",
+                "provision",
+                "--slug",
+                key,
+                "--env-file",
+                str(env_file),
+                "--admin-url",
+                admin_url,
+                *renames,
+            ],
+        )
+        if rc != 0:
+            raise RuntimeError(
+                f"sprout worktree-db provision failed ({rc}): {err or out}"
+            )
+        conn = json.loads(out)
+        written = read_env_values(env_file, track_keys)
+        expected[str(env_file)] = {
+            k: v for k, v in written.items() if k in track_keys
+        }
+    assert conn is not None
+    return {
+        "object": conn["object_name"],
+        "env_files": [str(p) for p in env_files],
+        "_expected_env": expected,
+        "_env_paths": env_files,
+    }
+
+
+def attach_preview(cfg, secrets, repo, worktree, key, with_steps: bool) -> dict:
+    """Point the worktree at the PR preview's database instead of a fresh one."""
+    del key, with_steps  # key reserved for state; steps run by caller
+    branch = branch_of(worktree)
+    if not branch:
+        raise RuntimeError("cannot resolve branch of worktree")
+    pr = resolve_pr(repo, branch)
+    if not pr:
+        raise RuntimeError(f"no open MR/PR found for branch {branch}")
+    rc, out, err = sprout_cli(cfg, secrets, ["list"])
+    if rc != 0:
+        raise RuntimeError(f"sprout list failed: {err or out}")
+    previews = json.loads(out).get("previews", [])
+    canonical = repo["canonical_repo_id"]
+    target = next(
+        (
+            p
+            for p in previews
+            if p["pr_id"] == pr
+            and (
+                p["canonical_repo_id"] in (canonical, f"{canonical}.git")
+                or p["slug"] == repo.get("slug")
+            )
+        ),
+        None,
+    )
+    if not target:
+        raise RuntimeError(
+            f"no sprout preview registered for {repo['name']} PR/MR {pr}"
+        )
+    owner = secrets.get("SPROUT_PREVIEW_OWNER_URL", "").strip()
+    if not owner:
+        raise RuntimeError(
+            "SPROUT_PREVIEW_OWNER_URL required for attach-preview"
+        )
+    admin = urllib.parse.urlsplit(owner)
+    host = secrets.get("SPROUT_PG_HOST") or admin.hostname or "127.0.0.1"
+    port = secrets.get("SPROUT_PG_PORT") or str(admin.port or 5432)
+    values = {
+        target_name(repo, "PGHOST"): host,
+        target_name(repo, "PGPORT"): port,
+        target_name(repo, "PGDATABASE"): target["db_name"],
+        target_name(repo, "PGUSER"): urllib.parse.unquote(admin.username or ""),
+        target_name(repo, "PGPASSWORD"): urllib.parse.unquote(
+            admin.password or ""
+        ),
+    }
+    env_files = [Path(worktree) / rel for rel in repo["env_files"]]
+    expected: dict[str, dict[str, str]] = {}
+    for env_file in env_files:
+        merge_env_file(env_file, values)
+        expected[str(env_file)] = dict(values)
+    return {
+        "object": target["db_name"],
+        "shared_with_preview": True,
+        "pr_id": pr,
+        "preview_url": target.get("hostname"),
+        "env_files": [str(p) for p in env_files],
+        "_expected_env": expected,
+        "_env_paths": env_files,
+    }
+
+
+def target_name(repo: dict, logical: str) -> str:
+    return (repo.get("renames") or {}).get(logical, logical)
+
+
+def resolve_pr(repo: dict, branch: str) -> int | None:
+    """Open MR/PR number for a branch, via glab/gh."""
+    canonical = repo["canonical_repo_id"]
+    forge = repo.get("forge", "gitlab")
+    slug = canonical.split("://", 1)[-1]
+    if forge == "gitlab":
+        # GitLab's API wants the project path WITHOUT the host.
+        host, _, project = slug.partition("/")
+        if not project:
+            log(f"cannot resolve PR: unexpected canonical repo id {canonical}")
+            return None
+        extra = {} if host == "gitlab.com" else {"GITLAB_HOST": host}
+        rc, out, err = run(
+            [
+                "glab",
+                "api",
+                f"projects/{urllib.parse.quote(project, safe='')}/merge_requests"
+                f"?source_branch={urllib.parse.quote(branch, safe='')}"
+                f"&state=opened",
+            ],
+            env=clean_env(extra),
+            timeout=60,
+        )
+        if rc != 0:
+            log(f"cannot resolve PR for {branch}: {err or out}")
+            return None
+        data = json.loads(out or "[]")
+        return int(data[0]["iid"]) if data else None
+    rc, out, err = run(
+        [
+            "gh",
+            "pr",
+            "list",
+            "--repo",
+            slug,
+            "--head",
+            branch,
+            "--state",
+            "open",
+            "--json",
+            "number",
+        ],
+        timeout=60,
+    )
+    if rc != 0:
+        log(f"cannot resolve PR for {branch}: {err or out}")
+        return None
+    data = json.loads(out or "[]")
+    return int(data[0]["number"]) if data else None
+
+
+def drop_key(cfg, secrets, key) -> None:
+    rc, out, err = sprout_cli(
+        cfg,
+        secrets,
+        [
+            "worktree-db",
+            "drop",
+            "--slug",
+            key,
+            "--admin-url",
+            require_admin_url(secrets),
+        ],
+    )
+    if rc != 0:
+        raise RuntimeError(
+            f"sprout worktree-db drop failed ({rc}): {err or out}"
+        )
+
+
+def run_steps(cfg, secrets, repo, worktree) -> list[dict]:
+    results = []
+    bun = cfg.get("bun") or shutil.which("bun") or "bun"
+    if repo.get("requires_node_modules") and not (
+        Path(worktree) / "node_modules"
+    ).exists():
+        log(
+            "steps skipped: node_modules missing "
+            "(install deps, then re-run provision)"
+        )
+        return [{"step": "all", "ok": True, "skipped": "node_modules missing"}]
+    # Repo scripts shell out to `bun` by name; hooks often lack ~/.bun/bin.
+    bun_dir = str(Path(bun).parent) if bun else ""
+    step_env = clean_env(
+        {
+            "PATH": (
+                (bun_dir + os.pathsep) if bun_dir else ""
+            )
+            + os.environ.get("PATH", ""),
+        }
+    )
+    admin = urllib.parse.urlsplit(require_admin_url(secrets))
+    for raw_step in repo.get("steps", []):
+        step = {"cmd": raw_step} if isinstance(raw_step, list) else raw_step
+        cmd = [bun if part == "{bun}" else part for part in step["cmd"]]
+        env = dict(step_env)
+        if step.get("as_admin"):
+            # Role DDL needs CREATEROLE; the worktree owner role lacks it.
+            user_key = target_name(repo, "PGUSER")
+            pass_key = target_name(repo, "PGPASSWORD")
+            env[user_key] = urllib.parse.unquote(admin.username or "")
+            env[pass_key] = urllib.parse.unquote(admin.password or "")
+            # Common app aliases when renames map PG* → DATABASE_*.
+            if user_key != "DATABASE_USER":
+                env.setdefault(
+                    "DATABASE_USER", urllib.parse.unquote(admin.username or "")
+                )
+            if pass_key != "DATABASE_PASSWORD":
+                env.setdefault(
+                    "DATABASE_PASSWORD",
+                    urllib.parse.unquote(admin.password or ""),
+                )
+        started = time.time()
+        try:
+            rc, out, err = run(cmd, cwd=worktree, env=env, timeout=900)
+        except subprocess.TimeoutExpired:
+            results.append(
+                {"step": " ".join(cmd), "ok": False, "error": "timeout"}
+            )
+            log(f"step TIMEOUT: {' '.join(cmd)}")
+            break
+        elapsed = round(time.time() - started, 1)
+        results.append(
+            {"step": " ".join(cmd), "ok": rc == 0, "seconds": elapsed}
+        )
+        log(
+            f"step {'ok' if rc == 0 else 'FAILED'} ({elapsed}s): {' '.join(cmd)}"
+        )
+        if rc != 0:
+            results[-1]["error"] = (err or out)[-600:]
+            break
+    return results
+
+
+def reap_for_repo(cfg, secrets, repo) -> None:
+    """Drop tracked DBs whose worktree path is gone from git worktree list."""
+    main = os.path.realpath(os.path.expanduser(repo["main_repo"]))
+    live = git_worktree_paths(main)
+    if not live:
+        return
+    state = load_state()
+    stale = [
+        (path, rec)
+        for path, rec in list(state["worktrees"].items())
+        if rec.get("repo") == repo["name"]
+        and rec.get("mode", "dedicated") != "preview"
+        and os.path.realpath(path) not in live
+    ]
+    for path, rec in stale:
+        key = rec.get("key")
+        if not key:
+            continue
+        log(f"reap: worktree gone ({path}); dropping {object_name(key)}")
+        try:
+            drop_key(cfg, secrets, key)
+        except Exception as exc:
+            log(f"reap: drop failed for {key}: {exc}")
+            continue
+        state["worktrees"].pop(path, None)
+    if stale:
+        save_state(state)
+
+
+def do_provision(
+    cfg,
+    secrets,
+    worktree,
+    mode="dedicated",
+    key=None,
+    with_steps=True,
+    settle: float | None = None,
+) -> dict:
+    worktree = os.path.realpath(worktree)
+    repo = repo_config(cfg, worktree)
+    if not repo:
+        raise SystemExit(
+            f"{worktree}: no repo config "
+            f"(add a repos[] entry with matching main_repo to {config_path()})"
+        )
+    try:
+        reap_for_repo(cfg, secrets, repo)
+    except Exception as exc:
+        log(f"reap warning: {exc}")
+
+    state = load_state()
+    key = key or pick_key(state, worktree, repo)
+    log(f"provision [{mode}] worktree={worktree} key={key} repo={repo['name']}")
+
+    if mode == "preview":
+        info = attach_preview(cfg, secrets, repo, worktree, key, with_steps)
+    else:
+        info = provision_dedicated(cfg, secrets, repo, worktree, key)
+
+    expected = info.pop("_expected_env", {})
+    env_paths = info.pop("_env_paths", [])
+    if settle is None:
+        settle = float(
+            os.environ.get("SPROUT_WT_SETTLE", str(DEFAULT_SETTLE_SECONDS))
+        )
+    reassert_env_files(env_paths, expected, settle)
+
+    steps = (
+        run_steps(cfg, secrets, repo, worktree)
+        if (with_steps and repo.get("steps"))
+        else []
+    )
+    record = {
+        "key": key,
+        "repo": repo["name"],
+        "mode": mode,
+        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "steps": steps,
+        **info,
+    }
+    state = load_state()
+    state["worktrees"][worktree] = record
+    save_state(state)
+    log(f"provisioned {info['object']} into {', '.join(info.get('env_files', []))}")
+    print(json.dumps({"ok": True, **record}, indent=2))
+    return record
+
+
+def do_drop(cfg, secrets, worktree=None, key=None, forget_only=False) -> dict:
+    state = load_state()
+    if worktree:
+        worktree = os.path.realpath(worktree)
+    record = state["worktrees"].get(worktree) if worktree else None
+    if record:
+        key = record["key"]
+    if not key and worktree:
+        key = normalize_key(Path(worktree).name or "")
+    if not key:
+        raise SystemExit("drop needs --worktree or --key")
+    shared = bool(record and record.get("mode") == "preview")
+    if shared:
+        log(
+            f"worktree {worktree} shares preview DB {record.get('object')}; "
+            "refusing to drop"
+        )
+    elif not forget_only:
+        drop_key(cfg, secrets, key)
+        log(f"dropped {object_name(key)}")
+    if record and worktree:
+        state["worktrees"].pop(worktree, None)
+        save_state(state)
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "key": key,
+                "dropped": not shared and not forget_only,
+                "refused_shared_preview": shared,
+            },
+            indent=2,
+        )
+    )
+    return {"key": key}
+
+
+def event_worktree_path() -> str | None:
+    payload = os.environ.get("HERDR_PLUGIN_EVENT_JSON") or ""
+    try:
+        data = json.loads(payload) if payload else {}
+    except json.JSONDecodeError:
+        data = {}
+    inner = data.get("data") if isinstance(data.get("data"), dict) else data
+    candidates = []
+    wt = inner.get("worktree") if isinstance(inner, dict) else None
+    if isinstance(wt, dict):
+        candidates.append(wt.get("path"))
+    workspace = inner.get("workspace") if isinstance(inner, dict) else None
+    if isinstance(workspace, dict):
+        nested = workspace.get("worktree")
+        if isinstance(nested, dict):
+            candidates.append(nested.get("checkout_path"))
+            candidates.append(nested.get("path"))
+    ctx = os.environ.get("HERDR_PLUGIN_CONTEXT_JSON") or ""
+    try:
+        context = json.loads(ctx) if ctx else {}
+    except json.JSONDecodeError:
+        context = {}
+    ctx_wt = context.get("worktree")
+    if isinstance(ctx_wt, dict):
+        candidates.append(ctx_wt.get("path"))
+        candidates.append(ctx_wt.get("checkout_path"))
+    candidates.append(os.environ.get("HERDR_WORKTREE"))
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
+
+
+def hook(event: str) -> int:
+    try:
+        cfg = load_config()
+    except SystemExit as exc:
+        log(f"hook {event}: {exc}")
+        return 0
+    secrets = load_secrets()
+    path = event_worktree_path()
+    if not path:
+        log(f"hook {event}: no worktree path in event payload, skipping")
+        return 0
+
+    try:
+        if event == "created":
+            if not repo_config(cfg, path):
+                log(f"hook created: no repo config for {path}, skipping")
+                return 0
+            do_provision(cfg, secrets, path)
+        else:
+            tracked = os.path.realpath(path) in load_state()["worktrees"]
+            if not tracked and not repo_config(cfg, path):
+                log(f"hook removed: {path} not tracked, skipping")
+                return 0
+            do_drop(cfg, secrets, worktree=path)
+    except SystemExit as exc:
+        log(f"hook {event}: {exc}")
+        return 1
+    except Exception as exc:
+        log(f"hook {event} FAILED: {type(exc).__name__}: {exc}")
+        return 1
+    return 0
+
+
+def list_postgres_worktree_dbs(secrets: dict[str, str]) -> list[str] | None:
+    """List sprout_wt_* databases via psql if available."""
+    admin_url = secrets.get("SPROUT_WORKTREE_ADMIN_URL", "").strip()
+    if not admin_url:
+        return None
+    psql = shutil.which("psql")
+    if not psql:
+        return None
+    rc, out, err = run(
+        [
+            psql,
+            admin_url,
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-tAc",
+            r"select datname from pg_database where datname like 'sprout_wt\_%'",
+        ],
+        timeout=60,
+    )
+    if rc != 0:
+        log(f"gc: psql list failed: {err or out}")
+        return None
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def key_from_object(obj: str) -> str | None:
+    if not obj.startswith("sprout_wt_"):
+        return None
+    return obj[len("sprout_wt_") :].replace("_", "-")
+
+
+def gc(cfg, secrets, dry_run=False) -> int:
+    """Drop sprout_wt_* objects with no live worktree behind them."""
+    require_admin_url(secrets)
+    state = load_state()
+
+    # 1) State entries whose path no longer exists.
+    for path, rec in list(state["worktrees"].items()):
+        if os.path.exists(path):
+            continue
+        if rec.get("mode") == "preview":
+            state["worktrees"].pop(path, None)
+            continue
+        key = rec.get("key")
+        if not key:
+            state["worktrees"].pop(path, None)
+            continue
+        log(f"gc: stale state {path} -> {object_name(key)}")
+        if dry_run:
+            continue
+        try:
+            drop_key(cfg, secrets, key)
+            log(f"gc: dropped {object_name(key)}")
+        except Exception as exc:
+            log(f"gc: drop failed for {key}: {exc}")
+            continue
+        state["worktrees"].pop(path, None)
+    if not dry_run:
+        save_state(state)
+
+    # 2) Live keys from git worktree list across configured repos.
+    live_objects: set[str] = set()
+    for repo in cfg.get("repos", []):
+        main = os.path.expanduser(repo["main_repo"])
+        for wt in git_worktree_paths(main):
+            key = normalize_key(Path(wt).name)
+            if key:
+                live_objects.add(object_name(key))
+        for path, rec in state["worktrees"].items():
+            if rec.get("repo") == repo["name"] and os.path.exists(path):
+                obj = rec.get("object")
+                if obj and str(obj).startswith("sprout_wt_"):
+                    live_objects.add(str(obj))
+
+    # 3) Optional postgres scan (psql).
+    objects = list_postgres_worktree_dbs(secrets)
+    if objects is None:
+        log(
+            "gc: skipping postgres scan (install psql on PATH for orphan scan); "
+            f"tracked live objects={len(live_objects)}"
+        )
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "dry_run": dry_run,
+                    "postgres_scan": False,
+                    "live_objects": sorted(live_objects),
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    orphans = [o for o in objects if o not in live_objects]
+    log(
+        f"gc: {len(objects)} worktree DB(s), {len(orphans)} orphan(s): "
+        f"{', '.join(orphans) or '-'}"
+    )
+    if dry_run:
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "dry_run": True,
+                    "objects": objects,
+                    "orphans": orphans,
+                },
+                indent=2,
+            )
+        )
+        return 0
+    for obj in orphans:
+        if not obj.startswith("sprout_wt_"):
+            log(f"gc: refusing non-prefixed name {obj}")
+            continue
+        key = key_from_object(obj)
+        if not key:
+            continue
+        try:
+            drop_key(cfg, secrets, key)
+            log(f"gc: dropped {obj}")
+        except Exception as exc:
+            log(f"gc: drop failed for {obj}: {exc}")
+    # Forget state rows that pointed at dropped orphans.
+    state = load_state()
+    for path, rec in list(state["worktrees"].items()):
+        if rec.get("object") in orphans:
+            state["worktrees"].pop(path, None)
+    save_state(state)
+    print(
+        json.dumps(
+            {"ok": True, "dry_run": False, "dropped": orphans}, indent=2
+        )
+    )
+    return 0
+
+
+def status() -> int:
+    state = load_state()
+    rows = []
+    for path, rec in sorted(state["worktrees"].items()):
+        rows.append(
+            {
+                "worktree": path,
+                "exists": os.path.exists(path),
+                "key": rec.get("key"),
+                "mode": rec.get("mode"),
+                "database": rec.get("object"),
+                "steps_ok": (
+                    all(s.get("ok") for s in rec.get("steps", []))
+                    if rec.get("steps")
+                    else None
+                ),
+            }
+        )
+    print(json.dumps({"worktrees": rows}, indent=2))
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="sprout-worktree-db", description=__doc__
+    )
+    sub = parser.add_subparsers(dest="mode", required=True)
+
+    p_hook = sub.add_parser("hook", help="herdr plugin event entrypoint")
+    p_hook.add_argument("event", choices=["created", "removed"])
+
+    p_action = sub.add_parser("action", help="herdr action entrypoint")
+    p_action.add_argument(
+        "name", choices=["provision", "drop", "attach-preview"]
+    )
+    p_action.add_argument(
+        "--no-steps",
+        action="store_true",
+        help="skip repo post-steps (migrate/bootstrap)",
+    )
+
+    p_prov = sub.add_parser(
+        "provision", help="provision + inject a dedicated DB"
+    )
+    p_prov.add_argument("--worktree", required=True)
+    p_prov.add_argument("--key")
+    p_prov.add_argument(
+        "--no-steps",
+        action="store_true",
+        help="skip repo post-steps (migrate/bootstrap)",
+    )
+    p_prov.add_argument(
+        "--settle",
+        type=float,
+        default=None,
+        help="seconds to wait and re-assert env keys (default 1.5; 0 to disable)",
+    )
+
+    p_prev = sub.add_parser(
+        "attach-preview", help="reuse the PR/MR preview database"
+    )
+    p_prev.add_argument("--worktree", required=True)
+    p_prev.add_argument("--key")
+
+    p_drop = sub.add_parser("drop", help="drop the worktree DB + role")
+    p_drop.add_argument("--worktree")
+    p_drop.add_argument("--key")
+    p_drop.add_argument("--forget-only", action="store_true")
+
+    p_gc = sub.add_parser(
+        "gc", help="drop worktree DBs whose worktree is gone"
+    )
+    p_gc.add_argument("--dry-run", action="store_true")
+
+    sub.add_parser("status", help="list tracked worktrees")
+
+    args = parser.parse_args()
+
+    if args.mode == "hook":
+        return hook(args.event)
+
+    cfg = load_config()
+    secrets = load_secrets()
+
+    if args.mode == "action":
+        path = event_worktree_path()
+        if not path:
+            raise SystemExit(
+                "no worktree in HERDR_PLUGIN_CONTEXT_JSON / event payload"
+            )
+        if args.name == "provision":
+            do_provision(
+                cfg,
+                secrets,
+                path,
+                with_steps=not args.no_steps,
+                settle=0 if args.no_steps else None,
+            )
+            return 0
+        if args.name == "drop":
+            do_drop(cfg, secrets, worktree=path)
+            return 0
+        do_provision(
+            cfg, secrets, path, mode="preview", with_steps=False, settle=0
+        )
+        return 0
+
+    if args.mode == "provision":
+        do_provision(
+            cfg,
+            secrets,
+            args.worktree,
+            key=args.key,
+            with_steps=not args.no_steps,
+            settle=args.settle,
+        )
+        return 0
+    if args.mode == "attach-preview":
+        do_provision(
+            cfg,
+            secrets,
+            args.worktree,
+            mode="preview",
+            key=args.key,
+            with_steps=False,
+            settle=0,
+        )
+        return 0
+    if args.mode == "drop":
+        do_drop(
+            cfg,
+            secrets,
+            worktree=args.worktree,
+            key=args.key,
+            forget_only=args.forget_only,
+        )
+        return 0
+    if args.mode == "gc":
+        return gc(cfg, secrets, dry_run=args.dry_run)
+    if args.mode == "status":
+        return status()
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
