@@ -167,7 +167,9 @@ explicitly:
 PLUGIN_ROOT=…   # herdr-managed checkout, or this repo when linked
 python3 "$PLUGIN_ROOT/bin/sprout-worktree-db" provision --worktree /path/to/wt
 python3 "$PLUGIN_ROOT/bin/sprout-worktree-db" drop --worktree /path/to/wt
+python3 "$PLUGIN_ROOT/bin/sprout-worktree-db" drop --force --worktree /path/to/wt
 python3 "$PLUGIN_ROOT/bin/sprout-worktree-db" gc --dry-run
+python3 "$PLUGIN_ROOT/bin/sprout-worktree-db" gc --reclaim-leases
 python3 "$PLUGIN_ROOT/bin/sprout-worktree-db" status
 python3 "$PLUGIN_ROOT/bin/sprout-worktree-db" attach-preview --worktree /path/to/wt
 ```
@@ -184,6 +186,12 @@ Herdr actions (from a workspace context): `provision`, `drop`, `gc`, `status`,
   (supports `--dry-run`) for orphan cleanup. With `psql` on `PATH`, `gc` also
   scans Postgres for `sprout_wt_*` orphans. Live objects are taken from **state**
   (never guessed from basename alone).
+- Drop takes an exclusive lease on the slug (`dropping` in state). A crash
+  mid-drop leaves the lease until it expires (1h TTL) or you reclaim it:
+  `drop --force --worktree …` / `gc --reclaim-leases`. Expired leases are also
+  cleared automatically on the next `provision` / `drop` / `gc`.
+- Each slug maps to at most one worktree path. GC never drops a DB while another
+  live path still holds the same key (stale duplicate rows are forgotten only).
 
 ## Preview mode
 

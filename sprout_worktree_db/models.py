@@ -8,7 +8,6 @@ from typing import Literal
 
 
 Mode = Literal["dedicated", "preview"]
-ClaimStatus = Literal["ready", "dropping"]
 StepsStatus = Literal["ok", "skipped", "failed"]
 
 
@@ -142,7 +141,6 @@ class WorktreeRecord:
     steps: list[dict] = field(default_factory=list)
     pr_id: int | None = None
     preview_url: str | None = None
-    status: ClaimStatus = "ready"
 
     def to_dict(self) -> dict:
         data: dict = {
@@ -158,16 +156,11 @@ class WorktreeRecord:
             data["pr_id"] = self.pr_id
         if self.preview_url is not None:
             data["preview_url"] = self.preview_url
-        if self.status != "ready":
-            data["status"] = self.status
         return data
 
     @classmethod
     def from_dict(cls, data: dict) -> WorktreeRecord:
-        raw_status = data.get("status") or "ready"
-        status: ClaimStatus = (
-            "dropping" if raw_status == "dropping" else "ready"
-        )
+        # Legacy "status" field is ignored — derived from dropping membership.
         return cls(
             key=str(data["key"]),
             repo=str(data.get("repo", "")),
@@ -178,26 +171,33 @@ class WorktreeRecord:
             steps=list(data.get("steps") or []),
             pr_id=data.get("pr_id"),
             preview_url=data.get("preview_url"),
-            status=status,
         )
 
 
 @dataclass(frozen=True)
 class DropReservation:
-    """Exclusive slug reservation while Postgres drop runs (or aborts)."""
+    """Exclusive slug reservation while Postgres drop runs (or aborts).
+
+    `worktrees` is the authoritative forget-set for this lease (every path
+    that currently holds the key, plus any remint path not yet in state).
+    """
 
     lease_id: int
     worktrees: tuple[str, ...]
     object_name: str
     skip_postgres: bool = False
+    reserved_at: str = ""  # ISO timestamp; missing → treat as expired
 
     def to_dict(self) -> dict:
-        return {
+        data = {
             "lease_id": self.lease_id,
             "worktrees": list(self.worktrees),
             "object_name": self.object_name,
             "skip_postgres": self.skip_postgres,
         }
+        if self.reserved_at:
+            data["reserved_at"] = self.reserved_at
+        return data
 
     @classmethod
     def from_dict(cls, key: str, data: dict | str) -> DropReservation:
@@ -207,6 +207,7 @@ class DropReservation:
                 lease_id=0,
                 worktrees=(data,) if data else (),
                 object_name="",
+                reserved_at="",
             )
         if not isinstance(data, dict):
             raise SystemExit(
@@ -228,6 +229,7 @@ class DropReservation:
             worktrees=tuple(str(p) for p in raw_wts if str(p)),
             object_name=str(data.get("object_name") or ""),
             skip_postgres=bool(data.get("skip_postgres")),
+            reserved_at=str(data.get("reserved_at") or ""),
         )
 
 
@@ -291,9 +293,6 @@ class PluginState:
             str(k): DropReservation.from_dict(str(k), v)
             for k, v in raw_drop.items()
         }
-        # Status is derived from dropping membership — clear stale writes.
-        for rec in worktrees.values():
-            rec.status = "dropping" if rec.key in dropping else "ready"
         try:
             next_id = int(data.get("next_lease_id") or 1)
         except (TypeError, ValueError) as exc:
@@ -324,6 +323,7 @@ class DropRequest:
     worktree: str | None = None
     key: str | None = None
     forget_only: bool = False
+    force: bool = False
 
 
 @dataclass(frozen=True)

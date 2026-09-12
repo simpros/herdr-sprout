@@ -23,7 +23,11 @@ from sprout_worktree_db.models import (
     RepoConfig,
     WorktreeRecord,
 )
-from sprout_worktree_db.paths import LEGACY_CONFIG_DIR, state_path
+from sprout_worktree_db.paths import LEGACY_CONFIG_DIR, log, state_path
+
+# Crash mid-drop leaves dropping[K] forever without reclaim. Expired leases
+# are abort-equivalent under lock so automation can recover.
+LEASE_TTL_SECONDS = 3600
 
 
 def normalize_key(raw: str) -> str | None:
@@ -159,9 +163,111 @@ def claim_status(state: PluginState, rec: WorktreeRecord) -> str:
     return "dropping" if rec.key in state.dropping else "ready"
 
 
-def _sync_claim_statuses(state: PluginState) -> None:
-    for rec in state.worktrees.values():
-        rec.status = claim_status(state, rec)
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _lease_age_seconds(res: DropReservation, now: datetime) -> float | None:
+    """Seconds since reserved_at, or None if unparseable. Missing → expired."""
+    if not res.reserved_at:
+        return None  # legacy / missing → reclaimable
+    try:
+        reserved = datetime.fromisoformat(res.reserved_at)
+    except ValueError:
+        return None
+    if reserved.tzinfo is None:
+        reserved = reserved.replace(tzinfo=timezone.utc)
+    return (now - reserved).total_seconds()
+
+
+def reclaim_expired_leases(
+    state: PluginState,
+    *,
+    force_keys: set[str] | None = None,
+    ttl_seconds: int = LEASE_TTL_SECONDS,
+) -> list[str]:
+    """Pop expired (or force_keys) dropping entries. Returns cleared keys.
+
+    Abort-equivalent: claims stay in worktrees; only the reservation clears.
+    """
+    now = datetime.now(timezone.utc)
+    cleared: list[str] = []
+    for key, res in list(state.dropping.items()):
+        if force_keys is not None:
+            if key not in force_keys:
+                continue
+        else:
+            age = _lease_age_seconds(res, now)
+            if age is not None and age < ttl_seconds:
+                continue
+        state.dropping.pop(key, None)
+        cleared.append(key)
+    return cleared
+
+
+def expired_lease_keys(
+    state: PluginState,
+    *,
+    ttl_seconds: int = LEASE_TTL_SECONDS,
+    all_leases: bool = False,
+) -> list[str]:
+    """Keys whose drop leases are expired (or all, when all_leases)."""
+    if all_leases:
+        return list(state.dropping)
+    now = datetime.now(timezone.utc)
+    out: list[str] = []
+    for key, res in state.dropping.items():
+        age = _lease_age_seconds(res, now)
+        if age is None or age >= ttl_seconds:
+            out.append(key)
+    return out
+
+
+def paths_for_key(state: PluginState, key: str) -> tuple[str, ...]:
+    """Every state path that currently holds ``key`` (authoritative forget-set)."""
+    return tuple(p for p, r in state.worktrees.items() if r.key == key)
+
+
+def _path_is_live(path: str, live_paths: set[str]) -> bool:
+    real = os.path.realpath(path) if path else ""
+    return bool(path and (os.path.exists(path) or real in live_paths))
+
+
+def key_has_live_sibling(
+    state: PluginState,
+    key: str,
+    *,
+    except_path: str | None,
+    live_paths: set[str],
+) -> bool:
+    """True if another path still holds ``key`` and exists on disk / in live set."""
+    for path, rec in state.worktrees.items():
+        if rec.key != key:
+            continue
+        if except_path is not None and path == except_path:
+            continue
+        if _path_is_live(path, live_paths):
+            return True
+    return False
+
+
+def prune_gone_sibling_rows(
+    state: PluginState, live_paths: set[str]
+) -> list[str]:
+    """Forget gone paths whose key is still held by a live sibling (no postgres).
+
+    Does not take a drop lease — the live claim owns the slug.
+    """
+    pruned: list[str] = []
+    for path, rec in list(state.worktrees.items()):
+        if not rec.key or _path_is_live(path, live_paths):
+            continue
+        if key_has_live_sibling(
+            state, rec.key, except_path=path, live_paths=live_paths
+        ):
+            state.worktrees.pop(path, None)
+            pruned.append(path)
+    return pruned
 
 
 def claim_key(
@@ -174,9 +280,11 @@ def claim_key(
     """Atomically resolve + persist a key claim before slow sprout work.
 
     Returns (key, previous_record). Re-provision reuses the stored key so
-    passwords/objects stay stable even if mint rules change.
+    passwords/objects stay stable even if mint rules change. One key maps to
+    at most one worktree path.
     """
     with locked_state() as state:
+        reclaim_expired_leases(state)
         previous = state.worktrees.get(worktree)
         if previous and previous.key in state.dropping:
             raise SystemExit(
@@ -185,6 +293,19 @@ def claim_key(
         key = resolve_key(state, worktree, repo, requested)
         if key in state.dropping:
             raise SystemExit(f"key {key!r}: drop in progress")
+        holder = next(
+            (
+                p
+                for p, r in state.worktrees.items()
+                if r.key == key and p != worktree
+            ),
+            None,
+        )
+        if holder:
+            raise SystemExit(
+                f"key {key!r} already claimed by {holder}; "
+                "drop that worktree first"
+            )
         mode_lit = "preview" if mode == "preview" else "dedicated"
         if previous is None:
             claim = WorktreeRecord(
@@ -192,9 +313,7 @@ def claim_key(
                 repo=repo.name,
                 mode=mode_lit,
                 object="",
-                created_at=datetime.now(timezone.utc).isoformat(
-                    timespec="seconds"
-                ),
+                created_at=_now_iso(),
             )
         else:
             # resolve_key always returns previous.key when a row exists.
@@ -218,6 +337,7 @@ def finalize_claim(
 ) -> None:
     """Compare-and-swap provision result onto a non-dropping claim."""
     with locked_state() as state:
+        reclaim_expired_leases(state)
         claimed = state.worktrees.get(worktree)
         if claimed is None:
             raise RuntimeError(
@@ -236,8 +356,18 @@ def finalize_claim(
             )
         if claimed.created_at:
             record.created_at = claimed.created_at
-        record.status = "ready"
         state.worktrees[worktree] = record
+
+
+def _forget_set(
+    state: PluginState, key: str, extra: tuple[str, ...] = ()
+) -> tuple[str, ...]:
+    """Authoritative forget-set: every path holding key, plus remint extras."""
+    paths = list(paths_for_key(state, key))
+    for p in extra:
+        if p and p not in paths:
+            paths.append(p)
+    return tuple(paths)
 
 
 def _reserve(
@@ -253,17 +383,18 @@ def _reserve(
         return None
     lease_id = state.next_lease_id
     state.next_lease_id = lease_id + 1
+    forget = _forget_set(state, key, worktrees)
     state.dropping[key] = DropReservation(
         lease_id=lease_id,
-        worktrees=worktrees,
+        worktrees=forget,
         object_name=object_name,
         skip_postgres=skip_postgres,
+        reserved_at=_now_iso(),
     )
-    _sync_claim_statuses(state)
     return DropLease(
         lease_id=lease_id,
         key=key,
-        worktrees=worktrees,
+        worktrees=forget,
         object_name=object_name,
         skip_postgres=skip_postgres,
     )
@@ -293,13 +424,11 @@ def _resolve_and_reserve(
             if rec.object:
                 obj = rec.object
                 break
-        paths = tuple(path for path, _ in matched)
-        if not paths and wt:
-            paths = (wt,)
+        extra = (wt,) if wt else ()
         lease = _reserve(
             state,
             key,
-            worktrees=paths,
+            worktrees=extra,
             object_name=obj,
             skip_postgres=skip,
         )
@@ -353,9 +482,29 @@ def begin_drop(
     worktree: str | None = None,
     *,
     requested: str | None = None,
+    force: bool = False,
 ) -> DropLease:
     """Reserve the slug under lock before slow Postgres drop (exclusive)."""
     with locked_state() as state:
+        if force:
+            force_keys: set[str] = set()
+            if requested:
+                nk = normalize_key(requested)
+                if nk:
+                    force_keys.add(nk)
+            wt = os.path.realpath(worktree) if worktree else None
+            if wt and wt in state.worktrees:
+                force_keys.add(state.worktrees[wt].key)
+            if force_keys:
+                cleared = reclaim_expired_leases(state, force_keys=force_keys)
+                for key in cleared:
+                    log(f"drop --force: reclaimed lease for {key!r}")
+            else:
+                reclaim_expired_leases(state)
+        else:
+            cleared = reclaim_expired_leases(state)
+            for key in cleared:
+                log(f"reclaimed expired drop lease for {key!r}")
         return _resolve_and_reserve(state, cfg, worktree, requested)
 
 
@@ -364,14 +513,6 @@ def reserve_from_plan(state: PluginState, plan: DropPlan) -> DropLease | None:
     if plan.state_path:
         rec = state.worktrees.get(plan.state_path)
         if rec is None:
-            return None
-        if plan.key and rec.key != plan.key:
-            return None
-        if (
-            plan.object_name
-            and rec.object
-            and rec.object != plan.object_name
-        ):
             return None
         obj = rec.object or plan.object_name or (
             object_name(rec.key) if rec.key else ""
@@ -399,14 +540,10 @@ def _clear_lease(state: PluginState, lease: DropLease, *, restore: bool) -> None
     if reserved is None or reserved.lease_id != lease.lease_id:
         return
     if not restore:
+        # Reservation owns the forget-set — no same-key scan.
         for path in reserved.worktrees:
             state.worktrees.pop(path, None)
-        # drop --key may have reserved paths; also clear any leftover same-key
-        for path, other in list(state.worktrees.items()):
-            if other.key == lease.key:
-                state.worktrees.pop(path, None)
     state.dropping.pop(lease.key, None)
-    _sync_claim_statuses(state)
 
 
 def finish_drop(lease: DropLease) -> None:

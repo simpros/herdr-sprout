@@ -79,7 +79,9 @@ def do_provision(
 def do_drop(cfg: PluginConfig, secrets: dict, req: DropRequest) -> dict:
     """Begin drop lease → Postgres drop → finish (inverse of claim)."""
     worktree = os.path.realpath(req.worktree) if req.worktree else None
-    lease = begin_drop(cfg, worktree, requested=req.key)
+    lease = begin_drop(
+        cfg, worktree, requested=req.key, force=req.force
+    )
 
     dropped = False
     skip_postgres = req.forget_only or lease.skip_postgres

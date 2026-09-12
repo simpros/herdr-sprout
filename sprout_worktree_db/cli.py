@@ -165,11 +165,21 @@ def main(argv: list[str] | None = None) -> int:
     p_drop.add_argument("--worktree")
     p_drop.add_argument("--key")
     p_drop.add_argument("--forget-only", action="store_true")
+    p_drop.add_argument(
+        "--force",
+        action="store_true",
+        help="steal a stuck drop lease for this worktree/key before dropping",
+    )
 
     p_gc = sub.add_parser(
         "gc", help="drop worktree DBs whose worktree is gone"
     )
     p_gc.add_argument("--dry-run", action="store_true")
+    p_gc.add_argument(
+        "--reclaim-leases",
+        action="store_true",
+        help="clear stuck drop leases (any age) before planning orphans",
+    )
 
     sub.add_parser("status", help="list tracked worktrees")
 
@@ -226,11 +236,17 @@ def main(argv: list[str] | None = None) -> int:
                 worktree=args.worktree,
                 key=args.key,
                 forget_only=args.forget_only,
+                force=args.force,
             ),
         )
         return 0
     if args.mode == "gc":
-        return gc(cfg, secrets, dry_run=args.dry_run)
+        return gc(
+            cfg,
+            secrets,
+            dry_run=args.dry_run,
+            reclaim_leases=args.reclaim_leases,
+        )
     if args.mode == "status":
         return status()
     return 2
