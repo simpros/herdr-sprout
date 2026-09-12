@@ -1,6 +1,7 @@
 {
   "cli": "sprout",
   "bun": "bun",
+  "auto_provision_on_create": false,
   "repos": [
     {
       "name": "example",

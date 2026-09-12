@@ -5,10 +5,9 @@ min_herdr_version = "0.8.0"
 description = "Provision a dedicated Postgres database per herdr worktree (via sprout worktree-db) and drop it on remove"
 platforms = ["linux", "macos"]
 
-# Default path: auto-provision on create, drop on remove.
-# If another worktree.created plugin copies .env files, wire the `provision`
-# action as an ordered step *after* those copies (see README). The created
-# hook also re-asserts injected keys after a short settle window.
+# worktree.created is a no-op unless config.auto_provision_on_create is true.
+# When another plugin copies .env files, leave that false and wire the
+# `provision` action as an ordered step *after* those copies (see README).
 [[events]]
 on = "worktree.created"
 command = ["python3", "bin/sprout-worktree-db", "hook", "created"]

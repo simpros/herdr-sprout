@@ -1,0 +1,236 @@
+"""sprout CLI wrappers: provision / drop / list."""
+
+from __future__ import annotations
+
+import json
+import shutil
+import urllib.parse
+from pathlib import Path
+
+from sprout_worktree_db.envfile import merge_env_file, read_env_values
+from sprout_worktree_db.gitutil import branch_of, run
+from sprout_worktree_db.models import EnvInjection
+from sprout_worktree_db.paths import clean_env, log, require_admin_url
+
+
+def resolve_sprout_cli(cfg: dict) -> str:
+    configured = cfg.get("cli")
+    if configured and Path(configured).exists():
+        return configured
+    found = shutil.which("sprout")
+    if found:
+        return found
+    raise SystemExit(
+        "sprout CLI not found (set config.cli or install sprout on PATH; "
+        "glibc hosts may need a source build — see README)"
+    )
+
+
+def sprout_cli(cfg: dict, secrets: dict, args: list[str]) -> tuple[int, str, str]:
+    cmd = [resolve_sprout_cli(cfg), *args]
+    env = clean_env(
+        {
+            "SPROUT_URL": secrets.get("SPROUT_URL", ""),
+            "SPROUT_TOKEN": secrets.get("SPROUT_ADMIN_TOKEN", ""),
+        }
+    )
+    return run(cmd, env=env)
+
+
+def target_name(repo: dict, logical: str) -> str:
+    return (repo.get("renames") or {}).get(logical, logical)
+
+
+def track_keys_for(repo: dict) -> set[str]:
+    return set((repo.get("renames") or {}).values()) | {
+        "PGHOST",
+        "PGPORT",
+        "PGDATABASE",
+        "PGUSER",
+        "PGPASSWORD",
+        "DATABASE_URL",
+    }
+
+
+def provision_dedicated(
+    cfg: dict, secrets: dict, repo: dict, worktree: str, key: str
+) -> EnvInjection:
+    """Provision once via sprout, then merge connection into each env file."""
+    admin_url = require_admin_url(secrets)
+    renames: list[str] = []
+    for logical, target in (repo.get("renames") or {}).items():
+        renames += ["--rename", f"{logical}={target}"]
+    env_files = [Path(worktree) / rel for rel in repo["env_files"]]
+    track_keys = track_keys_for(repo)
+
+    # Provision against a scratch env file so sprout writes once; then merge
+    # the resulting values into every configured path locally.
+    primary = env_files[0]
+    primary.parent.mkdir(parents=True, exist_ok=True)
+    primary.touch()
+    rc, out, err = sprout_cli(
+        cfg,
+        secrets,
+        [
+            "worktree-db",
+            "provision",
+            "--slug",
+            key,
+            "--env-file",
+            str(primary),
+            "--admin-url",
+            admin_url,
+            *renames,
+        ],
+    )
+    if rc != 0:
+        raise RuntimeError(
+            f"sprout worktree-db provision failed ({rc}): {err or out}"
+        )
+    conn = json.loads(out)
+    written = read_env_values(primary, track_keys)
+    values = {k: v for k, v in written.items() if k in track_keys}
+
+    expected: dict[Path, dict[str, str]] = {primary: dict(values)}
+    for env_file in env_files[1:]:
+        merge_env_file(env_file, values)
+        expected[env_file] = dict(values)
+
+    return EnvInjection(
+        object_name=conn["object_name"],
+        env_files=tuple(env_files),
+        expected=expected,
+    )
+
+
+def attach_preview(
+    cfg: dict, secrets: dict, repo: dict, worktree: str
+) -> EnvInjection:
+    """Point the worktree at the PR preview's database instead of a fresh one."""
+    branch = branch_of(worktree)
+    if not branch:
+        raise RuntimeError("cannot resolve branch of worktree")
+    pr = resolve_pr(repo, branch)
+    if not pr:
+        raise RuntimeError(f"no open MR/PR found for branch {branch}")
+    rc, out, err = sprout_cli(cfg, secrets, ["list"])
+    if rc != 0:
+        raise RuntimeError(f"sprout list failed: {err or out}")
+    previews = json.loads(out).get("previews", [])
+    canonical = repo["canonical_repo_id"]
+    target = next(
+        (
+            p
+            for p in previews
+            if p["pr_id"] == pr
+            and (
+                p["canonical_repo_id"] in (canonical, f"{canonical}.git")
+                or p["slug"] == repo.get("slug")
+            )
+        ),
+        None,
+    )
+    if not target:
+        raise RuntimeError(
+            f"no sprout preview registered for {repo['name']} PR/MR {pr}"
+        )
+    owner = secrets.get("SPROUT_PREVIEW_OWNER_URL", "").strip()
+    if not owner:
+        raise RuntimeError(
+            "SPROUT_PREVIEW_OWNER_URL required for attach-preview"
+        )
+    admin = urllib.parse.urlsplit(owner)
+    host = secrets.get("SPROUT_PG_HOST") or admin.hostname or "127.0.0.1"
+    port = secrets.get("SPROUT_PG_PORT") or str(admin.port or 5432)
+    values = {
+        target_name(repo, "PGHOST"): host,
+        target_name(repo, "PGPORT"): port,
+        target_name(repo, "PGDATABASE"): target["db_name"],
+        target_name(repo, "PGUSER"): urllib.parse.unquote(admin.username or ""),
+        target_name(repo, "PGPASSWORD"): urllib.parse.unquote(
+            admin.password or ""
+        ),
+    }
+    env_files = [Path(worktree) / rel for rel in repo["env_files"]]
+    expected: dict[Path, dict[str, str]] = {}
+    for env_file in env_files:
+        merge_env_file(env_file, values)
+        expected[env_file] = dict(values)
+    return EnvInjection(
+        object_name=target["db_name"],
+        env_files=tuple(env_files),
+        expected=expected,
+        shared_with_preview=True,
+        pr_id=pr,
+        preview_url=target.get("hostname"),
+    )
+
+
+def resolve_pr(repo: dict, branch: str) -> int | None:
+    """Open MR/PR number for a branch, via glab/gh."""
+    canonical = repo["canonical_repo_id"]
+    forge = repo.get("forge", "gitlab")
+    slug = canonical.split("://", 1)[-1]
+    if forge == "gitlab":
+        # GitLab's API wants the project path WITHOUT the host.
+        host, _, project = slug.partition("/")
+        if not project:
+            log(f"cannot resolve PR: unexpected canonical repo id {canonical}")
+            return None
+        extra = {} if host == "gitlab.com" else {"GITLAB_HOST": host}
+        rc, out, err = run(
+            [
+                "glab",
+                "api",
+                f"projects/{urllib.parse.quote(project, safe='')}/merge_requests"
+                f"?source_branch={urllib.parse.quote(branch, safe='')}"
+                f"&state=opened",
+            ],
+            env=clean_env(extra),
+            timeout=60,
+        )
+        if rc != 0:
+            log(f"cannot resolve PR for {branch}: {err or out}")
+            return None
+        data = json.loads(out or "[]")
+        return int(data[0]["iid"]) if data else None
+    rc, out, err = run(
+        [
+            "gh",
+            "pr",
+            "list",
+            "--repo",
+            slug,
+            "--head",
+            branch,
+            "--state",
+            "open",
+            "--json",
+            "number",
+        ],
+        timeout=60,
+    )
+    if rc != 0:
+        log(f"cannot resolve PR for {branch}: {err or out}")
+        return None
+    data = json.loads(out or "[]")
+    return int(data[0]["number"]) if data else None
+
+
+def drop_key(cfg: dict, secrets: dict, key: str) -> None:
+    rc, out, err = sprout_cli(
+        cfg,
+        secrets,
+        [
+            "worktree-db",
+            "drop",
+            "--slug",
+            key,
+            "--admin-url",
+            require_admin_url(secrets),
+        ],
+    )
+    if rc != 0:
+        raise RuntimeError(
+            f"sprout worktree-db drop failed ({rc}): {err or out}"
+        )

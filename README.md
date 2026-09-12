@@ -1,9 +1,14 @@
 # herdr-sprout
 
 Official [herdr](https://herdr.dev) plugin for [sprout](https://github.com/simpros/sprout):
-per-worktree Postgres isolation. On `worktree.created` it provisions a dedicated
-`sprout_wt_*` database + login and injects credentials into a configurable env
-file; on `worktree.removed` it drops them.
+per-worktree Postgres isolation. Provisions a dedicated `sprout_wt_*` database
++ login and injects credentials into a configurable env file; on
+`worktree.removed` it drops them.
+
+Auto-provision on `worktree.created` is **off by default** (`auto_provision_on_create`).
+Enable it for greenfield repos with no competing `.env` copy, or call the
+ordered `provision` action after setup plugins (recommended when another plugin
+copies `.env*` files).
 
 ## Install
 
@@ -69,6 +74,7 @@ Per-repo entries keyed by `main_repo` path (same idea as `tdi.worktree-setup`):
 {
   "cli": "sprout",
   "bun": "bun",
+  "auto_provision_on_create": false,
   "repos": [
     {
       "name": "myapp",
@@ -85,31 +91,48 @@ Per-repo entries keyed by `main_repo` path (same idea as `tdi.worktree-setup`):
       "requires_node_modules": true,
       "steps": [
         { "cmd": ["{bun}", "run", "db:migrate"] },
-        { "cmd": ["{bun}", "run", "db:bootstrap"], "as_admin": true }
+        {
+          "cmd": ["{bun}", "run", "db:bootstrap"],
+          "as_admin": true
+        }
       ]
     }
   ]
 }
 ```
 
-- **Slug** comes from the worktree directory basename (sprout grammar: lowercase,
-  `[^a-z0-9-]` → `-`, max 40), with a short suffix on collision. Prefer path
-  basenames over branch names so multiple repos can share one Postgres.
+- **`auto_provision_on_create`**: when `true`, the `worktree.created` hook runs
+  provision (best-effort, no settle/sleep). Default `false` — prefer an ordered
+  setup step when another plugin copies `.env` files.
+- **Slug** comes from `{repo}-{worktree-basename}` (sprout grammar: lowercase,
+  `[^a-z0-9-]` → `-`, max 40), with a stable SHA-1 path suffix on collision.
+  Prefer path basenames over branch names so multiple repos can share one Postgres.
+  Object names for GC come from **state**, not basename guesses.
 - **`renames`** map sprout's canonical `PG*` / `DATABASE_URL` keys to app names.
 - **`steps`** run after provision (migrate before bootstrap). Use `"as_admin": true`
-  for steps that need `CREATEROLE`. When `requires_node_modules` is true and
+  to inject the admin user/password into the renamed `PGUSER`/`PGPASSWORD` keys.
+  Optional `admin_env` adds extra env vars for that step only (no hard-coded
+  app aliases in the runner). When `requires_node_modules` is true and
   `node_modules` is missing, steps are skipped with a clear log line.
 - Env writes are atomic (temp + rename). Re-provision keeps the existing password.
 
+### Worktree path (herdr ≥ 0.8)
+
+Hooks and actions resolve the checkout path from, in order:
+
+1. `HERDR_WORKTREE`
+2. event `data.worktree.path`
+3. event `data.workspace.worktree.checkout_path` (or `.path`)
+4. context `worktree.checkout_path` (or `.path`) from `HERDR_PLUGIN_CONTEXT_JSON`
+
+If none are present the hook logs and skips (fail closed).
+
 ## Ordering with `.env`-copying setup plugins
 
-Two plugins on `worktree.created` have **no ordering guarantee**. If a setup
-plugin copies the main repo's `.env*` *after* this plugin injects credentials,
-the worktree silently falls back to the shared database.
-
-**Recommended** when a setup plugin is present: call provision as an ordered
-step *after* the copies (two-phase, both idempotent). Symlink the CLI onto
-your `PATH` once after install:
+Two plugins on `worktree.created` have **no ordering guarantee**. Leave
+`auto_provision_on_create` false and call provision as an ordered step *after*
+the copies (two-phase, both idempotent). Symlink the CLI onto your `PATH` once
+after install:
 
 ```bash
 # managed checkout path appears in `herdr plugin list`
@@ -121,17 +144,15 @@ ln -sf /path/to/herdr-managed/herdr-sprout/bin/sprout-worktree-db ~/.local/bin/s
 steps = [
   'cp "$HERDR_MAIN_REPO"/.env* . 2>/dev/null || true',
   # DB + env injection only — must not be lost if install fails
-  'sprout-worktree-db provision --worktree "$HERDR_WORKTREE" --no-steps --settle 0',
+  'sprout-worktree-db provision --worktree "$HERDR_WORKTREE" --no-steps',
   'bun install',
   # re-ensure + migrate/bootstrap once deps exist
-  'sprout-worktree-db provision --worktree "$HERDR_WORKTREE" --settle 0',
+  'sprout-worktree-db provision --worktree "$HERDR_WORKTREE"',
 ]
 ```
 
 You can also run `herdr plugin action invoke provision --plugin sprout.worktree-db`
-from a workspace context. The created hook still re-asserts injected keys after
-a short settle window (`SPROUT_WT_SETTLE`, default `1.5` seconds) when a
-competing writer is detected.
+from a workspace context.
 
 ## Manual escape hatch
 
@@ -154,10 +175,10 @@ Herdr actions (from a workspace context): `provision`, `drop`, `gc`, `status`,
 
 - `worktree.removed` drops only `sprout_wt_*` objects for dedicated databases.
 - `drop` refuses shared preview databases (`attach-preview` mode) and says so.
-- Out-of-band `git worktree remove` emits no herdr event. Each `provision` reaps
-  tracked DBs for that repo whose path is absent from `git worktree list`.
-- Schedule `gc` (supports `--dry-run`) for a full pass. With `psql` on `PATH`,
-  `gc` also scans Postgres for `sprout_wt_*` orphans.
+- Out-of-band `git worktree remove` emits no herdr event. Schedule `gc`
+  (supports `--dry-run`) for orphan cleanup. With `psql` on `PATH`, `gc` also
+  scans Postgres for `sprout_wt_*` orphans. Live objects are taken from **state**
+  (never guessed from basename alone).
 
 ## Preview mode
 
@@ -172,3 +193,5 @@ branch → MR/PR → `sprout list` and points the env file at
 herdr plugin link /path/to/herdr-sprout
 python3 -m unittest discover -s test -v
 ```
+
+Package layout: `sprout_worktree_db/` (library) + `bin/sprout-worktree-db` (thin shim).
