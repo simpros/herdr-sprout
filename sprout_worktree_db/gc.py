@@ -16,7 +16,7 @@ from sprout_worktree_db.state import (
     key_from_object,
     load_state,
     locked_state,
-    object_name,
+    postgres_target,
     reclaim_expired_leases,
     reserve_from_plan,
 )
@@ -38,8 +38,9 @@ def live_objects_from_state(
     """Object names still claimed by an existing worktree path in state.
 
     State is the only source of truth for object names — never guess from
-    basename alone. Slugs under an active drop lease also count as live so
-    concurrent GC does not double-plan them.
+    basename alone. Active drop leases that will touch Postgres also count
+    as live so concurrent GC does not double-plan them. Forget-only /
+    preview leases (``skip_postgres``) hold the slug only.
     """
     live: set[str] = set()
     for path, rec in state.worktrees.items():
@@ -48,15 +49,14 @@ def live_objects_from_state(
             continue
         if rec.key in state.dropping:
             continue
-        if rec.object and str(rec.object).startswith("sprout_wt_"):
-            live.add(str(rec.object))
-        elif rec.key and rec.mode != "preview":
-            live.add(object_name(rec.key))
+        obj, skip = postgres_target(rec, rec.key)
+        if not skip and obj:
+            live.add(obj)
     for key, res in state.dropping.items():
-        if res.object_name and res.object_name.startswith("sprout_wt_"):
+        if res.skip_postgres:
+            continue
+        if res.object_name:
             live.add(res.object_name)
-        else:
-            live.add(object_name(key))
     return live
 
 
@@ -80,27 +80,23 @@ def plan_orphans(
         path_gone = not os.path.exists(path) and real not in live_paths
         if not path_gone:
             continue
-        if rec.mode == "preview":
-            plans.append(
-                DropPlan(
-                    key=rec.key,
-                    object_name=rec.object,
-                    reason="stale preview state",
-                    state_path=path,
-                    skip_postgres=True,
-                )
-            )
-            continue
-        obj = rec.object or object_name(rec.key)
+        obj, skip = postgres_target(rec, rec.key)
+        reason = (
+            "stale preview state"
+            if skip
+            else f"worktree gone ({path})"
+        )
         plans.append(
             DropPlan(
                 key=rec.key,
                 object_name=obj,
-                reason=f"worktree gone ({path})",
+                reason=reason,
                 state_path=path,
+                skip_postgres=skip,
             )
         )
-        seen_objects.add(obj)
+        if not skip and obj:
+            seen_objects.add(obj)
 
     live_objects = live_objects_from_state(state, live_paths)
     # Objects we already planned to drop should not count as live.
@@ -159,11 +155,11 @@ def reserve_orphan_leases(
     live_paths: set[str],
     postgres_names: list[str] | None,
     *,
-    steal_all: bool = False,
+    reclaim_leases: bool = False,
 ) -> tuple[list[DropPlan], list[tuple[DropPlan, DropLease]]]:
     """Under one lock: reclaim leases, plan orphans, reserve."""
     with locked_state() as state:
-        if steal_all:
+        if reclaim_leases:
             for key in reclaim_expired_leases(state, force_all=True):
                 log(f"gc --reclaim-leases: cleared {key!r}")
         else:
@@ -191,7 +187,7 @@ def apply_drop_leases(
     """Execute reserved drop leases; return object names that were dropped."""
     dropped: list[str] = []
     for plan, lease in reserved:
-        log(f"gc: {plan.reason} -> {plan.object_name or plan.key}")
+        log(f"gc: {plan.reason} -> {lease.object_name or lease.key}")
         try:
             if not lease.skip_postgres:
                 drop_key(cfg, secrets, lease.key)
@@ -201,9 +197,9 @@ def apply_drop_leases(
             log(f"gc: drop failed for {lease.key}: {exc}")
             continue
         if not lease.skip_postgres:
-            log(f"gc: dropped {plan.object_name or object_name(lease.key)}")
-            if plan.object_name:
-                dropped.append(plan.object_name)
+            log(f"gc: dropped {lease.object_name or lease.key}")
+            if lease.object_name:
+                dropped.append(lease.object_name)
     return dropped
 
 
@@ -229,7 +225,7 @@ def gc(
         dropped: list[str] = []
     else:
         plans, reserved = reserve_orphan_leases(
-            live_paths, postgres, steal_all=reclaim_leases
+            live_paths, postgres, reclaim_leases=reclaim_leases
         )
         dropped = apply_drop_leases(cfg, secrets, reserved)
 

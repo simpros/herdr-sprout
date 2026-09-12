@@ -28,6 +28,7 @@ from sprout_worktree_db.state import (  # noqa: E402
     mint_key,
     normalize_key,
     object_name,
+    postgres_target,
     resolve_key,
     stable_suffix,
 )
@@ -61,6 +62,32 @@ class NormalizeKeyTest(unittest.TestCase):
 
     def test_object_name(self):
         self.assertEqual(object_name("my-feature"), "sprout_wt_my_feature")
+
+    def test_postgres_target_unified(self):
+        """--key and --worktree must agree for the same claim."""
+        preview = WorktreeRecord(
+            key="app-prev",
+            repo="app",
+            mode="preview",
+            object="",
+            created_at="",
+        )
+        self.assertEqual(postgres_target(preview, "app-prev"), ("", True))
+        dedicated = WorktreeRecord(
+            key="app-feat",
+            repo="app",
+            mode="dedicated",
+            object="",
+            created_at="",
+        )
+        self.assertEqual(
+            postgres_target(dedicated, "app-feat"),
+            ("sprout_wt_app_feat", False),
+        )
+        self.assertEqual(
+            postgres_target(None, "remint-key"),
+            ("sprout_wt_remint_key", False),
+        )
 
 
 class MergeEnvFileTest(unittest.TestCase):
@@ -217,6 +244,56 @@ class PlanOrphansTest(unittest.TestCase):
             self.assertEqual(live, {"sprout_wt_repo_feature_abc12"})
             self.assertNotIn("sprout_wt_feature", live)
 
+    def test_live_objects_skips_forget_only_leases(self):
+        """Preview/forget leases must not invent a sprout_wt_* live name."""
+        from sprout_worktree_db.models import DropLease
+
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = Path(tmp) / "feature"
+            wt.mkdir()
+            state_data = PluginState(
+                worktrees={
+                    str(wt): WorktreeRecord(
+                        key="app-prev",
+                        repo="app",
+                        mode="preview",
+                        object="sprout_shared_pr1",
+                        created_at="",
+                    )
+                },
+                dropping={
+                    "app-prev": DropLease(
+                        lease_id=1,
+                        key="app-prev",
+                        worktrees=(str(wt),),
+                        object_name="",
+                        skip_postgres=True,
+                        reserved_at="2020-01-01T00:00:00+00:00",
+                    )
+                },
+            )
+            live = gc_mod.live_objects_from_state(
+                state_data, {os.path.realpath(str(wt))}
+            )
+            self.assertEqual(live, set())
+            # Real orphan with same key shape must still be planable.
+            plans = gc_mod.plan_orphans(
+                state_data,
+                {os.path.realpath(str(wt))},
+                ["sprout_wt_app_prev"],
+            )
+            # key app-prev is in dropping → postgres orphan skipped by lease
+            self.assertEqual(plans, [])
+            # Different orphan key still appears.
+            plans2 = gc_mod.plan_orphans(
+                PluginState(dropping=state_data.dropping),
+                set(),
+                ["sprout_wt_other_orphan"],
+            )
+            self.assertEqual(
+                [p.object_name for p in plans2], ["sprout_wt_other_orphan"]
+            )
+
 
 class EventPathTest(unittest.TestCase):
     def test_herdr_worktree_env(self):
@@ -322,6 +399,37 @@ class DropLeaseTest(unittest.TestCase):
                 self.assertIn(lease.key, state.load_state().dropping)
                 state.finish_drop(lease)
                 self.assertNotIn(lease.key, state.load_state().dropping)
+            finally:
+                del os.environ["HERDR_PLUGIN_STATE_DIR"]
+
+    def test_preview_key_and_worktree_agree(self):
+        """Empty preview object: --key and --worktree use the same rule."""
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["HERDR_PLUGIN_STATE_DIR"] = tmp
+            try:
+                wt = str(Path(tmp) / "feature")
+                Path(wt).mkdir()
+                st = PluginState(
+                    worktrees={
+                        wt: WorktreeRecord(
+                            key="app-prev",
+                            repo="app",
+                            mode="preview",
+                            object="",
+                            created_at="",
+                        )
+                    }
+                )
+                state.save_state(st)
+                cfg = PluginConfig(repos=(_repo("app"),))
+                by_wt = state.begin_drop(cfg, wt)
+                self.assertEqual(by_wt.object_name, "")
+                self.assertTrue(by_wt.skip_postgres)
+                state.abort_drop(by_wt)
+                by_key = state.begin_drop(cfg, requested="app-prev")
+                self.assertEqual(by_key.object_name, "")
+                self.assertTrue(by_key.skip_postgres)
+                state.finish_drop(by_key)
             finally:
                 del os.environ["HERDR_PLUGIN_STATE_DIR"]
 

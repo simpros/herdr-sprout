@@ -20,7 +20,6 @@ from sprout_worktree_db.state import (
     claim_key,
     finalize_claim,
     finish_drop,
-    object_name,
 )
 from sprout_worktree_db.steps import run_steps
 from sprout_worktree_db.sprout import attach_preview, drop_key, provision_dedicated
@@ -99,7 +98,7 @@ def do_drop(cfg: PluginConfig, secrets: dict, req: DropRequest) -> dict:
             abort_drop(lease)
             raise
         dropped = True
-        log(f"dropped {object_name(lease.key)}")
+        log(f"dropped {lease.object_name or lease.key}")
 
     finish_drop(lease)
     print(

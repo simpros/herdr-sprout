@@ -43,6 +43,17 @@ def object_name(key: str) -> str:
     return "sprout_wt_" + key.replace("-", "_")
 
 
+def postgres_target(
+    rec: WorktreeRecord | None, key: str
+) -> tuple[str, bool]:
+    """(object_name, skip_postgres) — single rule for drop + GC."""
+    if rec is None:
+        return object_name(key), False
+    if rec.mode == "preview":
+        return (rec.object or ""), True
+    return (rec.object or object_name(rec.key)), False
+
+
 def key_from_object(obj: str) -> str | None:
     if not obj.startswith("sprout_wt_"):
         return None
@@ -370,34 +381,32 @@ def _drop_target(
             raise SystemExit(f"invalid --key: {requested!r}")
         path = path_for_key(state, key)
         rec = state.worktrees[path] if path else None
+        obj, skip = postgres_target(rec, key)
         return DropTarget(
             key=key,
-            object_name=(
-                rec.object if rec and rec.object else object_name(key)
-            ),
-            skip_postgres=rec.mode == "preview" if rec else False,
+            object_name=obj,
+            skip_postgres=skip,
             extra_paths=(wt,) if wt else (),
         )
 
     if wt:
         record = state.worktrees.get(wt)
         if record:
-            obj = record.object or (
-                "" if record.mode == "preview" else object_name(record.key)
-            )
+            obj, skip = postgres_target(record, record.key)
             return DropTarget(
                 key=record.key,
                 object_name=obj,
-                skip_postgres=record.mode == "preview",
+                skip_postgres=skip,
                 extra_paths=(wt,),
             )
         repo = repo_config(cfg, wt)
         if repo:
             key = mint_key(wt, repo)
+            obj, skip = postgres_target(None, key)
             return DropTarget(
                 key=key,
-                object_name=object_name(key),
-                skip_postgres=False,
+                object_name=obj,
+                skip_postgres=skip,
                 extra_paths=(wt,),
             )
         raise SystemExit(
@@ -454,27 +463,17 @@ def begin_drop(
 def reserve_from_plan(state: PluginState, plan: DropPlan) -> DropLease | None:
     """Reserve under an already-held lock (GC). None if slug busy / gone.
 
-    Planner owns ``skip_postgres``; lease copies that bit once.
+    Planner owns ``object_name`` and ``skip_postgres``; lease copies both.
     """
-    if plan.state_path:
-        rec = state.worktrees.get(plan.state_path)
-        if rec is None:
-            return None
-        obj = rec.object or plan.object_name or object_name(rec.key)
-        return _reserve(
-            state,
-            rec.key,
-            worktrees=(plan.state_path,),
-            object_name=obj,
-            skip_postgres=plan.skip_postgres,
-        )
+    if plan.state_path and plan.state_path not in state.worktrees:
+        return None
     if not plan.key:
         return None
     return _reserve(
         state,
         plan.key,
-        worktrees=(),
-        object_name=plan.object_name or object_name(plan.key),
+        worktrees=(plan.state_path,) if plan.state_path else (),
+        object_name=plan.object_name,
         skip_postgres=plan.skip_postgres,
     )
 
