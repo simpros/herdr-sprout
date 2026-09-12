@@ -18,6 +18,7 @@ from sprout_worktree_db.models import (
     DropLease,
     DropPlan,
     DropTarget,
+    Mode,
     PluginConfig,
     PluginState,
     RepoConfig,
@@ -243,7 +244,7 @@ def claim_key(
     worktree: str,
     repo: RepoConfig,
     *,
-    mode: str,
+    mode: Mode,
     requested: str | None = None,
 ) -> tuple[str, WorktreeRecord | None]:
     """Atomically resolve + persist a key claim before slow sprout work.
@@ -251,6 +252,10 @@ def claim_key(
     Returns (key, previous_record). Re-provision reuses the stored key so
     passwords/objects stay stable even if mint rules change. One key maps to
     at most one worktree path.
+
+    Claim only reserves the key. On re-claim the existing row is left
+    untouched until ``finalize_claim`` writes mode/object — so mid-flight
+    mode flips cannot lie to ``postgres_target`` / drop / GC.
     """
     with locked_state() as state:
         reclaim_expired_leases(state)
@@ -275,29 +280,15 @@ def claim_key(
                 f"key {key!r} already claimed by {holder}; "
                 "drop that worktree first"
             )
-        mode_lit = "preview" if mode == "preview" else "dedicated"
         if previous is None:
-            claim = WorktreeRecord(
+            state.worktrees[worktree] = WorktreeRecord(
                 key=key,
                 repo=repo.name,
-                mode=mode_lit,
+                mode=mode,
                 object="",
                 created_at=_now_iso(),
             )
-        else:
-            # resolve_key always returns previous.key when a row exists.
-            claim = WorktreeRecord(
-                key=previous.key,
-                repo=repo.name,
-                mode=mode_lit,
-                object=previous.object,
-                created_at=previous.created_at,
-                env_files=list(previous.env_files),
-                steps=list(previous.steps),
-                pr_id=previous.pr_id,
-                preview_url=previous.preview_url,
-            )
-        state.worktrees[worktree] = claim
+        # else: leave previous row untouched until finalize_claim
         return key, previous
 
 

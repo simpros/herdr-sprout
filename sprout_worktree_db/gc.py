@@ -9,10 +9,9 @@ import shutil
 from sprout_worktree_db.gitutil import git_worktree_paths, run
 from sprout_worktree_db.models import DropLease, DropPlan, PluginConfig, PluginState
 from sprout_worktree_db.paths import log, require_admin_url
+from sprout_worktree_db.provision import execute_drop_lease
 from sprout_worktree_db.state import (
-    abort_drop,
     expired_lease_keys,
-    finish_drop,
     key_from_object,
     load_state,
     locked_state,
@@ -20,7 +19,6 @@ from sprout_worktree_db.state import (
     reclaim_expired_leases,
     reserve_from_plan,
 )
-from sprout_worktree_db.sprout import drop_key
 
 
 def live_worktree_paths_for_config(cfg: PluginConfig) -> set[str]:
@@ -188,15 +186,14 @@ def apply_drop_leases(
     dropped: list[str] = []
     for plan, lease in reserved:
         log(f"gc: {plan.reason} -> {lease.object_name or lease.key}")
-        try:
-            if not lease.skip_postgres:
-                drop_key(cfg, secrets, lease.key)
-            finish_drop(lease)
-        except Exception as exc:
-            abort_drop(lease)
-            log(f"gc: drop failed for {lease.key}: {exc}")
-            continue
-        if not lease.skip_postgres:
+        ok = execute_drop_lease(
+            cfg,
+            secrets,
+            lease,
+            skip_postgres=lease.skip_postgres,
+            reraise=False,
+        )
+        if ok:
             log(f"gc: dropped {lease.object_name or lease.key}")
             if lease.object_name:
                 dropped.append(lease.object_name)

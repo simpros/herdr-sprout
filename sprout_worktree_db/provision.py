@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 
 from sprout_worktree_db.gitutil import repo_config
 from sprout_worktree_db.models import (
+    DropLease,
     DropRequest,
     PluginConfig,
     ProvisionRequest,
@@ -75,6 +76,33 @@ def do_provision(
     return payload
 
 
+def execute_drop_lease(
+    cfg: PluginConfig,
+    secrets: dict,
+    lease: DropLease,
+    *,
+    skip_postgres: bool,
+    reraise: bool,
+) -> bool:
+    """One lease lifecycle: skip / drop_key → finish, or abort on failure.
+
+    Returns True when Postgres drop ran successfully.
+    """
+    if skip_postgres:
+        finish_drop(lease)
+        return False
+    try:
+        drop_key(cfg, secrets, lease.key)
+        finish_drop(lease)
+        return True
+    except Exception as exc:
+        abort_drop(lease)
+        if reraise:
+            raise
+        log(f"drop failed for {lease.key}: {exc}")
+        return False
+
+
 def do_drop(cfg: PluginConfig, secrets: dict, req: DropRequest) -> dict:
     """Begin drop lease → Postgres drop → finish (inverse of claim)."""
     worktree = os.path.realpath(req.worktree) if req.worktree else None
@@ -82,7 +110,6 @@ def do_drop(cfg: PluginConfig, secrets: dict, req: DropRequest) -> dict:
         cfg, worktree, requested=req.key, force=req.force
     )
 
-    dropped = False
     skip_postgres = req.forget_only or lease.skip_postgres
     if skip_postgres:
         reason = (
@@ -91,16 +118,15 @@ def do_drop(cfg: PluginConfig, secrets: dict, req: DropRequest) -> dict:
             else "--forget-only"
         )
         log(f"forgetting claim for {lease.key}; {reason}")
-    else:
-        try:
-            drop_key(cfg, secrets, lease.key)
-        except Exception:
-            abort_drop(lease)
-            raise
-        dropped = True
+    dropped = execute_drop_lease(
+        cfg,
+        secrets,
+        lease,
+        skip_postgres=skip_postgres,
+        reraise=True,
+    )
+    if dropped:
         log(f"dropped {lease.object_name or lease.key}")
-
-    finish_drop(lease)
     print(
         json.dumps(
             {
