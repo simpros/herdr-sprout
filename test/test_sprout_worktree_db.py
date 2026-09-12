@@ -294,33 +294,39 @@ class StepsSkipTest(unittest.TestCase):
         )
 
 
-class ReleaseKeyTest(unittest.TestCase):
+class DropLeaseTest(unittest.TestCase):
     def test_fail_closed_without_state_or_repo(self):
         cfg = PluginConfig(repos=())
-        # PluginConfig requires non-empty repos at from_dict, but we can
-        # construct empty for unit tests of release lookup.
         with self.assertRaises(SystemExit) as ctx:
-            state.release_key(cfg, "/tmp/ghost-wt", requested=None)
+            state.begin_drop(cfg, "/tmp/ghost-wt", requested=None)
         self.assertIn("--key", str(ctx.exception))
 
     def test_remint_when_repo_known(self):
         with tempfile.TemporaryDirectory() as tmp:
-            wt = str(Path(tmp) / "feature")
-            Path(wt).mkdir()
-            main = str(Path(tmp) / "main")
-            Path(main).mkdir()
-            cfg = PluginConfig(
-                repos=(_repo("myapp", main_repo=main, env_files=(".env",)),)
-            )
-            with mock.patch(
-                "sprout_worktree_db.state.repo_config",
-                return_value=_repo("myapp"),
-            ):
-                key, skip = state.release_key(cfg, wt)
-            self.assertFalse(skip)
-            self.assertEqual(key, mint_key(wt, _repo("myapp")))
+            os.environ["HERDR_PLUGIN_STATE_DIR"] = tmp
+            try:
+                wt = str(Path(tmp) / "feature")
+                Path(wt).mkdir()
+                main = str(Path(tmp) / "main")
+                Path(main).mkdir()
+                cfg = PluginConfig(
+                    repos=(_repo("myapp", main_repo=main, env_files=(".env",)),)
+                )
+                with mock.patch(
+                    "sprout_worktree_db.state.repo_config",
+                    return_value=_repo("myapp"),
+                ):
+                    lease = state.begin_drop(cfg, wt)
+                assert lease is not None
+                self.assertEqual(lease.key, mint_key(wt, _repo("myapp")))
+                self.assertFalse(lease.skip_postgres)
+                self.assertIn(lease.key, state.load_state().dropping)
+                state.finish_drop(lease)
+                self.assertNotIn(lease.key, state.load_state().dropping)
+            finally:
+                del os.environ["HERDR_PLUGIN_STATE_DIR"]
 
-    def test_release_pops_under_lock_before_return(self):
+    def test_begin_reserves_until_finish(self):
         with tempfile.TemporaryDirectory() as tmp:
             os.environ["HERDR_PLUGIN_STATE_DIR"] = tmp
             try:
@@ -339,14 +345,23 @@ class ReleaseKeyTest(unittest.TestCase):
                 )
                 state.save_state(st)
                 cfg = PluginConfig(repos=(_repo("app"),))
-                key, skip = state.release_key(cfg, wt)
-                self.assertEqual(key, "app-feature-abc12")
-                self.assertFalse(skip)
+                lease = state.begin_drop(cfg, wt)
+                assert lease is not None
+                self.assertEqual(lease.key, "app-feature-abc12")
+                mid = state.load_state()
+                self.assertEqual(mid.worktrees[wt].status, "dropping")
+                self.assertIn("app-feature-abc12", mid.dropping)
+                # Concurrent claim must fail closed while lease is held.
+                with self.assertRaises(SystemExit) as ctx:
+                    state.claim_key(wt, _repo("app"), mode="dedicated")
+                self.assertIn("drop in progress", str(ctx.exception))
+                state.finish_drop(lease)
                 self.assertNotIn(wt, state.load_state().worktrees)
+                self.assertNotIn("app-feature-abc12", state.load_state().dropping)
             finally:
                 del os.environ["HERDR_PLUGIN_STATE_DIR"]
 
-    def test_only_if_key_skips_when_claim_changed(self):
+    def test_expect_key_skips_when_claim_changed(self):
         with tempfile.TemporaryDirectory() as tmp:
             os.environ["HERDR_PLUGIN_STATE_DIR"] = tmp
             try:
@@ -365,12 +380,79 @@ class ReleaseKeyTest(unittest.TestCase):
                 )
                 state.save_state(st)
                 cfg = PluginConfig(repos=(_repo("app"),))
-                key, skip = state.release_key(
-                    cfg, wt, only_if_key="old-key", only_if_object="sprout_wt_old"
+                lease = state.begin_drop(
+                    cfg,
+                    wt,
+                    expect_key="old-key",
+                    expect_object="sprout_wt_old",
                 )
-                self.assertIsNone(key)
-                self.assertTrue(skip)
+                self.assertIsNone(lease)
                 self.assertIn(wt, state.load_state().worktrees)
+                self.assertEqual(state.load_state().worktrees[wt].status, "ready")
+            finally:
+                del os.environ["HERDR_PLUGIN_STATE_DIR"]
+
+    def test_abort_restores_ready_claim(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["HERDR_PLUGIN_STATE_DIR"] = tmp
+            try:
+                wt = str(Path(tmp) / "feature")
+                Path(wt).mkdir()
+                st = PluginState(
+                    worktrees={
+                        wt: WorktreeRecord(
+                            key="app-feature-abc12",
+                            repo="app",
+                            mode="dedicated",
+                            object="sprout_wt_app_feature_abc12",
+                            created_at="",
+                        )
+                    }
+                )
+                state.save_state(st)
+                cfg = PluginConfig(repos=(_repo("app"),))
+                lease = state.begin_drop(cfg, wt)
+                assert lease is not None
+                state.abort_drop(lease)
+                after = state.load_state()
+                self.assertEqual(after.worktrees[wt].status, "ready")
+                self.assertNotIn("app-feature-abc12", after.dropping)
+            finally:
+                del os.environ["HERDR_PLUGIN_STATE_DIR"]
+
+    def test_finalize_refuses_dropping_claim(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["HERDR_PLUGIN_STATE_DIR"] = tmp
+            try:
+                wt = str(Path(tmp) / "feature")
+                Path(wt).mkdir()
+                st = PluginState(
+                    worktrees={
+                        wt: WorktreeRecord(
+                            key="app-feature-abc12",
+                            repo="app",
+                            mode="dedicated",
+                            object="sprout_wt_app_feature_abc12",
+                            created_at="2020-01-01T00:00:00+00:00",
+                            status="dropping",
+                        )
+                    },
+                    dropping={"app-feature-abc12": wt},
+                )
+                state.save_state(st)
+                with self.assertRaises(RuntimeError) as ctx:
+                    state.finalize_claim(
+                        wt,
+                        "app-feature-abc12",
+                        WorktreeRecord(
+                            key="app-feature-abc12",
+                            repo="app",
+                            mode="dedicated",
+                            object="sprout_wt_app_feature_abc12",
+                            created_at="",
+                        ),
+                    )
+                self.assertIn("drop in progress", str(ctx.exception))
             finally:
                 del os.environ["HERDR_PLUGIN_STATE_DIR"]
 
@@ -395,6 +477,36 @@ class PluginConfigTest(unittest.TestCase):
                 {"worktrees": {"/wt": {"object": "sprout_wt_x"}}}
             )
         self.assertIn("missing 'key'", str(ctx.exception))
+
+    def test_unreadable_state_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["HERDR_PLUGIN_STATE_DIR"] = tmp
+            try:
+                path = Path(tmp) / "state.json"
+                path.write_text("{")
+                with self.assertRaises(SystemExit) as ctx:
+                    state.load_state()
+                self.assertIn("corrupt state.json", str(ctx.exception))
+                # File must be unchanged (no empty wipe via locked_state).
+                self.assertEqual(path.read_text(), "{")
+                with self.assertRaises(SystemExit):
+                    with state.locked_state():
+                        pass
+                self.assertEqual(path.read_text(), "{")
+            finally:
+                del os.environ["HERDR_PLUGIN_STATE_DIR"]
+
+    def test_non_object_state_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["HERDR_PLUGIN_STATE_DIR"] = tmp
+            try:
+                path = Path(tmp) / "state.json"
+                path.write_text("[1,2,3]\n")
+                with self.assertRaises(SystemExit) as ctx:
+                    state.load_state()
+                self.assertIn("root must be an object", str(ctx.exception))
+            finally:
+                del os.environ["HERDR_PLUGIN_STATE_DIR"]
 
 
 class ConfigDirTest(unittest.TestCase):

@@ -50,6 +50,7 @@ def status() -> int:
                 "exists": os.path.exists(path),
                 "key": rec.key,
                 "mode": rec.mode,
+                "status": rec.status,
                 "database": rec.object,
                 "steps_status": steps_status(rec.steps),
             }

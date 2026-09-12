@@ -8,6 +8,7 @@ from typing import Literal
 
 
 Mode = Literal["dedicated", "preview"]
+ClaimStatus = Literal["ready", "dropping"]
 StepsStatus = Literal["ok", "skipped", "failed"]
 
 
@@ -141,6 +142,7 @@ class WorktreeRecord:
     steps: list[dict] = field(default_factory=list)
     pr_id: int | None = None
     preview_url: str | None = None
+    status: ClaimStatus = "ready"
 
     def to_dict(self) -> dict:
         data: dict = {
@@ -156,10 +158,16 @@ class WorktreeRecord:
             data["pr_id"] = self.pr_id
         if self.preview_url is not None:
             data["preview_url"] = self.preview_url
+        if self.status != "ready":
+            data["status"] = self.status
         return data
 
     @classmethod
     def from_dict(cls, data: dict) -> WorktreeRecord:
+        raw_status = data.get("status") or "ready"
+        status: ClaimStatus = (
+            "dropping" if raw_status == "dropping" else "ready"
+        )
         return cls(
             key=str(data["key"]),
             repo=str(data.get("repo", "")),
@@ -170,19 +178,35 @@ class WorktreeRecord:
             steps=list(data.get("steps") or []),
             pr_id=data.get("pr_id"),
             preview_url=data.get("preview_url"),
+            status=status,
         )
+
+
+@dataclass(frozen=True)
+class DropLease:
+    """Slug reserved under lock until Postgres drop finishes (or aborts)."""
+
+    key: str
+    worktree: str | None
+    object_name: str
+    skip_postgres: bool = False
 
 
 @dataclass
 class PluginState:
     worktrees: dict[str, WorktreeRecord] = field(default_factory=dict)
+    # key → worktree path (or "") while a drop lease holds the slug
+    dropping: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
-        return {
+        data: dict = {
             "worktrees": {
                 path: rec.to_dict() for path, rec in self.worktrees.items()
             }
         }
+        if self.dropping:
+            data["dropping"] = dict(self.dropping)
+        return data
 
     @classmethod
     def from_dict(cls, data: dict) -> PluginState:
@@ -201,7 +225,11 @@ class PluginState:
                     "(fix or remove the row)"
                 )
             worktrees[str(path)] = WorktreeRecord.from_dict(rec)
-        return cls(worktrees=worktrees)
+        raw_drop = data.get("dropping") or {}
+        if raw_drop and not isinstance(raw_drop, dict):
+            raise SystemExit("corrupt state.json: 'dropping' must be an object")
+        dropping = {str(k): str(v) for k, v in raw_drop.items()}
+        return cls(worktrees=worktrees, dropping=dropping)
 
 
 @dataclass(frozen=True)

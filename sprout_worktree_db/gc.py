@@ -10,10 +10,12 @@ from sprout_worktree_db.gitutil import git_worktree_paths, run
 from sprout_worktree_db.models import DropPlan, PluginConfig, PluginState
 from sprout_worktree_db.paths import log, require_admin_url
 from sprout_worktree_db.state import (
+    abort_drop,
+    begin_drop,
+    finish_drop,
     key_from_object,
     load_state,
     object_name,
-    release_key,
 )
 from sprout_worktree_db.sprout import drop_key
 
@@ -33,7 +35,8 @@ def live_objects_from_state(
     """Object names still claimed by an existing worktree path in state.
 
     State is the only source of truth for object names — never guess from
-    basename alone.
+    basename alone. Slugs under an active drop lease also count as live so
+    concurrent GC does not double-plan them.
     """
     live: set[str] = set()
     for path, rec in state.worktrees.items():
@@ -44,6 +47,8 @@ def live_objects_from_state(
             live.add(str(rec.object))
         elif rec.key and rec.mode != "preview":
             live.add(object_name(rec.key))
+    for key in state.dropping:
+        live.add(object_name(key))
     return live
 
 
@@ -154,9 +159,8 @@ def apply_drop_plans(
 ) -> list[str]:
     """Execute drop plans; return object names that were (or would be) dropped.
 
-    For each plan with a state path: release (forget) under lock first — the
-    inverse of claim — then drop Postgres. Match guards skip when a concurrent
-    provision replaced the claim.
+    For each plan: begin_drop (lease reserves the slug) → Postgres → finish_drop.
+    ``expect_*`` skips when a concurrent re-provision replaced the claim.
     """
     dropped: list[str] = []
     for plan in plans:
@@ -166,34 +170,46 @@ def apply_drop_plans(
                 dropped.append(plan.object_name)
             continue
 
-        should_drop = not plan.skip_drop and bool(plan.key)
         if plan.state_path:
-            key, skip = release_key(
+            lease = begin_drop(
                 cfg,
                 plan.state_path,
-                only_if_key=plan.key or None,
-                only_if_object=plan.object_name or None,
+                expect_key=plan.key or None,
+                expect_object=plan.object_name or None,
             )
-            if key is None:
+            if lease is None:
                 log(
                     f"gc: skip {plan.object_name or plan.key}; "
                     "state claim changed under us"
                 )
                 continue
-            should_drop = not skip and not plan.skip_drop and bool(key)
-            drop_slug = key
+        elif plan.key:
+            lease = begin_drop(cfg, None, requested=plan.key)
+            if lease is None:
+                continue
         else:
-            drop_slug = plan.key
+            continue
 
-        if should_drop and drop_slug:
-            try:
-                drop_key(cfg, secrets, drop_slug)
-                log(f"gc: dropped {plan.object_name or object_name(drop_slug)}")
+        try:
+            if plan.skip_drop or lease.skip_postgres:
+                finish_drop(lease)
+            else:
+                try:
+                    drop_key(cfg, secrets, lease.key)
+                except Exception as exc:
+                    abort_drop(lease)
+                    log(f"gc: drop failed for {lease.key}: {exc}")
+                    continue
+                finish_drop(lease)
+                log(
+                    f"gc: dropped {plan.object_name or object_name(lease.key)}"
+                )
                 if plan.object_name:
                     dropped.append(plan.object_name)
-            except Exception as exc:
-                log(f"gc: drop failed for {drop_slug}: {exc}")
-                continue
+        except Exception as exc:
+            abort_drop(lease)
+            log(f"gc: drop failed for {lease.key}: {exc}")
+            continue
     return dropped
 
 

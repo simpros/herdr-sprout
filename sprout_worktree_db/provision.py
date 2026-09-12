@@ -14,7 +14,14 @@ from sprout_worktree_db.models import (
     WorktreeRecord,
 )
 from sprout_worktree_db.paths import config_path, log
-from sprout_worktree_db.state import claim_key, locked_state, object_name, release_key
+from sprout_worktree_db.state import (
+    abort_drop,
+    begin_drop,
+    claim_key,
+    finalize_claim,
+    finish_drop,
+    object_name,
+)
 from sprout_worktree_db.steps import run_steps
 from sprout_worktree_db.sprout import attach_preview, drop_key, provision_dedicated
 
@@ -58,16 +65,7 @@ def do_provision(
         pr_id=injection.pr_id,
         preview_url=injection.preview_url,
     )
-    with locked_state() as state:
-        claimed = state.worktrees.get(worktree)
-        if claimed and claimed.key != key:
-            raise RuntimeError(
-                f"key claim lost for {worktree}: held {claimed.key!r}, "
-                f"provisioned {key!r}"
-            )
-        if claimed and claimed.created_at:
-            record.created_at = claimed.created_at
-        state.worktrees[worktree] = record
+    finalize_claim(worktree, key, record)
 
     payload = record.to_dict()
     log(
@@ -79,27 +77,35 @@ def do_provision(
 
 
 def do_drop(cfg: PluginConfig, secrets: dict, req: DropRequest) -> dict:
-    """Release state claim under lock, then drop Postgres (inverse of claim)."""
+    """Begin drop lease → Postgres drop → finish (inverse of claim)."""
     worktree = os.path.realpath(req.worktree) if req.worktree else None
-    key, skip_drop = release_key(cfg, worktree, requested=req.key)
-    if key is None:
+    lease = begin_drop(cfg, worktree, requested=req.key)
+    if lease is None:
         raise SystemExit("drop could not resolve a key")
-    if skip_drop:
-        log(
-            f"worktree {worktree} shares preview DB; refusing to drop"
-        )
-    elif not req.forget_only:
-        drop_key(cfg, secrets, key)
-        log(f"dropped {object_name(key)}")
+
+    dropped = False
+    refused = lease.skip_postgres and not req.forget_only
+    if refused:
+        log(f"worktree {worktree} shares preview DB; refusing to drop")
+    elif not req.forget_only and not lease.skip_postgres:
+        try:
+            drop_key(cfg, secrets, lease.key)
+        except Exception:
+            abort_drop(lease)
+            raise
+        dropped = True
+        log(f"dropped {object_name(lease.key)}")
+
+    finish_drop(lease)
     print(
         json.dumps(
             {
                 "ok": True,
-                "key": key,
-                "dropped": not skip_drop and not req.forget_only,
-                "refused_shared_preview": skip_drop,
+                "key": lease.key,
+                "dropped": dropped,
+                "refused_shared_preview": refused,
             },
             indent=2,
         )
     )
-    return {"key": key}
+    return {"key": lease.key}

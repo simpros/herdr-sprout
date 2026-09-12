@@ -1,4 +1,4 @@
-"""State load/save and worktree key minting / release."""
+"""State load/save and worktree key minting / drop leases."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from typing import Iterator
 
 from sprout_worktree_db.gitutil import repo_config
 from sprout_worktree_db.models import (
+    DropLease,
     PluginConfig,
     PluginState,
     RepoConfig,
@@ -106,11 +107,21 @@ def _read_state_file() -> PluginState:
         else:
             return PluginState()
     try:
-        data = json.loads(path.read_text())
-    except (json.JSONDecodeError, OSError):
-        return PluginState()
+        text = path.read_text()
+    except OSError as exc:
+        raise SystemExit(f"cannot read state.json: {exc}") from exc
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(
+            f"corrupt state.json: invalid JSON ({exc}); "
+            "fix or remove the file — refusing to wipe claims"
+        ) from exc
     if not isinstance(data, dict):
-        return PluginState()
+        raise SystemExit(
+            "corrupt state.json: root must be an object; "
+            "refusing to wipe claims"
+        )
     return PluginState.from_dict(data)
 
 
@@ -155,14 +166,30 @@ def claim_key(
     """
     with locked_state() as state:
         previous = state.worktrees.get(worktree)
+        if previous and previous.status == "dropping":
+            raise SystemExit(
+                f"{worktree}: drop in progress for key {previous.key!r}"
+            )
         key = resolve_key(state, worktree, repo, requested)
-        # Keep prior object/created_at when reclaiming the same key so a crash
-        # mid-provision does not orphan the row's identity.
-        if previous and previous.key == key:
+        if key in state.dropping:
+            raise SystemExit(f"key {key!r}: drop in progress")
+        mode_lit = "preview" if mode == "preview" else "dedicated"
+        if previous is None:
             claim = WorktreeRecord(
                 key=key,
                 repo=repo.name,
-                mode="preview" if mode == "preview" else "dedicated",
+                mode=mode_lit,
+                object="",
+                created_at=datetime.now(timezone.utc).isoformat(
+                    timespec="seconds"
+                ),
+            )
+        else:
+            # resolve_key always returns previous.key when a row exists.
+            claim = WorktreeRecord(
+                key=previous.key,
+                repo=repo.name,
+                mode=mode_lit,
                 object=previous.object,
                 created_at=previous.created_at,
                 env_files=list(previous.env_files),
@@ -170,74 +197,149 @@ def claim_key(
                 pr_id=previous.pr_id,
                 preview_url=previous.preview_url,
             )
-        else:
-            claim = WorktreeRecord(
-                key=key,
-                repo=repo.name,
-                mode="preview" if mode == "preview" else "dedicated",
-                object="",
-                created_at=datetime.now(timezone.utc).isoformat(
-                    timespec="seconds"
-                ),
-            )
         state.worktrees[worktree] = claim
         return key, previous
 
 
-def release_key(
-    cfg: PluginConfig,
+def finalize_claim(
+    worktree: str, key: str, record: WorktreeRecord
+) -> None:
+    """Compare-and-swap provision result onto a non-dropping claim."""
+    with locked_state() as state:
+        claimed = state.worktrees.get(worktree)
+        if claimed is None:
+            raise RuntimeError(
+                f"key claim lost for {worktree}: row removed during provision "
+                f"(provisioned {key!r})"
+            )
+        if claimed.status == "dropping":
+            raise RuntimeError(
+                f"key claim lost for {worktree}: drop in progress for "
+                f"{claimed.key!r} (provisioned {key!r})"
+            )
+        if claimed.key != key:
+            raise RuntimeError(
+                f"key claim lost for {worktree}: held {claimed.key!r}, "
+                f"provisioned {key!r}"
+            )
+        if claimed.created_at:
+            record.created_at = claimed.created_at
+        record.status = "ready"
+        state.worktrees[worktree] = record
+
+
+def _reserve_dropping(
+    state: PluginState,
+    key: str,
     worktree: str | None,
+    record: WorktreeRecord | None,
+) -> DropLease:
+    """Mark slug reserved; keep the worktree row until finish_drop."""
+    skip_postgres = bool(record and record.mode == "preview")
+    obj = ""
+    if record:
+        obj = record.object or (object_name(key) if not skip_postgres else "")
+        record.status = "dropping"
+        if worktree:
+            state.worktrees[worktree] = record
+    state.dropping[key] = worktree or ""
+    return DropLease(
+        key=key,
+        worktree=worktree,
+        object_name=obj,
+        skip_postgres=skip_postgres,
+    )
+
+
+def begin_drop(
+    cfg: PluginConfig,
+    worktree: str | None = None,
     *,
     requested: str | None = None,
-    only_if_key: str | None = None,
-    only_if_object: str | None = None,
-) -> tuple[str | None, bool]:
-    """Inverse of claim_key: resolve + forget under lock, then caller drops.
+    expect_key: str | None = None,
+    expect_object: str | None = None,
+) -> DropLease | None:
+    """Reserve the slug under lock before slow Postgres drop.
 
-    Returns (key, skip_drop). ``key`` is None when ``only_if_*`` guards fail
-    (a concurrent re-provision replaced the claim — caller must not drop).
-
-    ``requested`` is the drop/forget escape hatch: forget every row with that
-    key and return it for ``drop_key``. Provision must not use this path.
+    Returns None when ``expect_*`` identity no longer matches (concurrent
+    re-provision replaced the claim — caller must not drop).
     """
     with locked_state() as state:
         wt = os.path.realpath(worktree) if worktree else None
         record = state.worktrees.get(wt) if wt else None
 
-        if only_if_key is not None or only_if_object is not None:
+        if expect_key is not None or expect_object is not None:
             if record is None:
                 # Already forgotten; still allow orphan drop via planned key.
-                return only_if_key, False
-            if only_if_key is not None and record.key != only_if_key:
-                return None, True
+                if expect_key and expect_key in state.dropping:
+                    return DropLease(
+                        key=expect_key,
+                        worktree=wt,
+                        object_name=expect_object or object_name(expect_key),
+                        skip_postgres=False,
+                    )
+                if expect_key:
+                    state.dropping[expect_key] = wt or ""
+                    return DropLease(
+                        key=expect_key,
+                        worktree=wt,
+                        object_name=expect_object or object_name(expect_key),
+                        skip_postgres=False,
+                    )
+                return None
+            if expect_key is not None and record.key != expect_key:
+                return None
             if (
-                only_if_object is not None
+                expect_object is not None
                 and record.object
-                and record.object != only_if_object
+                and record.object != expect_object
             ):
-                return None, True
-            key = record.key
-            shared = record.mode == "preview"
+                return None
             assert wt is not None
-            state.worktrees.pop(wt, None)
-            return key, shared
+            if record.status == "dropping" and record.key in state.dropping:
+                return DropLease(
+                    key=record.key,
+                    worktree=wt,
+                    object_name=record.object or object_name(record.key),
+                    skip_postgres=record.mode == "preview",
+                )
+            return _reserve_dropping(state, record.key, wt, record)
 
         if requested:
             key = normalize_key(requested)
             if not key:
                 raise SystemExit(f"invalid --key: {requested!r}")
-            shared = False
-            for path, rec in list(state.worktrees.items()):
-                if rec.key == key:
-                    shared = shared or rec.mode == "preview"
-                    state.worktrees.pop(path, None)
-            return key, shared
+            # Forget every row with this key; reserve slug until finish.
+            matched = [
+                (path, rec)
+                for path, rec in list(state.worktrees.items())
+                if rec.key == key
+            ]
+            skip = False
+            obj = object_name(key)
+            for path, rec in matched:
+                skip = skip or rec.mode == "preview"
+                rec.status = "dropping"
+                state.worktrees[path] = rec
+                if rec.object:
+                    obj = rec.object
+            state.dropping[key] = matched[0][0] if matched else (wt or "")
+            return DropLease(
+                key=key,
+                worktree=matched[0][0] if matched else wt,
+                object_name=obj,
+                skip_postgres=skip,
+            )
 
         if record and wt:
-            key = record.key
-            shared = record.mode == "preview"
-            state.worktrees.pop(wt, None)
-            return key, shared
+            if record.status == "dropping" and record.key in state.dropping:
+                return DropLease(
+                    key=record.key,
+                    worktree=wt,
+                    object_name=record.object or object_name(record.key),
+                    skip_postgres=record.mode == "preview",
+                )
+            return _reserve_dropping(state, record.key, wt, record)
 
         if not wt:
             raise SystemExit("drop needs --worktree or --key")
@@ -245,9 +347,60 @@ def release_key(
         repo = repo_config(cfg, wt)
         if repo:
             # Honest recovery when state was wiped but path+repo still known.
-            return mint_key(wt, repo), False
+            key = mint_key(wt, repo)
+            if key in state.dropping:
+                raise SystemExit(f"key {key!r}: drop in progress")
+            state.dropping[key] = wt
+            return DropLease(
+                key=key,
+                worktree=wt,
+                object_name=object_name(key),
+                skip_postgres=False,
+            )
 
         raise SystemExit(
             f"no state row for {wt}; pass --key "
             "(or ensure repo config matches so the slug can be reminted)"
         )
+
+
+def finish_drop(lease: DropLease) -> None:
+    """Pop the dropping claim only if the lease still owns the slug."""
+    with locked_state() as state:
+        if lease.worktree:
+            rec = state.worktrees.get(lease.worktree)
+            if (
+                rec
+                and rec.status == "dropping"
+                and rec.key == lease.key
+            ):
+                state.worktrees.pop(lease.worktree, None)
+            # Also clear any other rows marked dropping for this key
+            # (drop --key may have reserved several paths).
+            for path, other in list(state.worktrees.items()):
+                if other.key == lease.key and other.status == "dropping":
+                    state.worktrees.pop(path, None)
+        else:
+            for path, other in list(state.worktrees.items()):
+                if other.key == lease.key and other.status == "dropping":
+                    state.worktrees.pop(path, None)
+        state.dropping.pop(lease.key, None)
+
+
+def abort_drop(lease: DropLease) -> None:
+    """Clear dropping reservation after a failed Postgres drop (keep claim)."""
+    with locked_state() as state:
+        if lease.worktree:
+            rec = state.worktrees.get(lease.worktree)
+            if (
+                rec
+                and rec.status == "dropping"
+                and rec.key == lease.key
+            ):
+                rec.status = "ready"
+                state.worktrees[lease.worktree] = rec
+        for path, other in list(state.worktrees.items()):
+            if other.key == lease.key and other.status == "dropping":
+                other.status = "ready"
+                state.worktrees[path] = other
+        state.dropping.pop(lease.key, None)
