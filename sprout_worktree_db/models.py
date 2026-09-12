@@ -175,6 +175,16 @@ class WorktreeRecord:
 
 
 @dataclass(frozen=True)
+class DropTarget:
+    """Resolved drop identity before reservation (by --key / row / remint)."""
+
+    key: str
+    object_name: str
+    skip_postgres: bool
+    extra_paths: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class DropLease:
     """Exclusive slug reservation — persisted under ``dropping[key]``.
 
@@ -332,4 +342,4 @@ class DropPlan:
     object_name: str
     reason: str
     state_path: str | None = None
-    skip_drop: bool = False  # preview / forget-only
+    skip_postgres: bool = False  # preview / no object; forget_only is execute-time only

@@ -87,18 +87,7 @@ def plan_orphans(
                     object_name=rec.object,
                     reason="stale preview state",
                     state_path=path,
-                    skip_drop=True,
-                )
-            )
-            continue
-        if not rec.key:
-            plans.append(
-                DropPlan(
-                    key="",
-                    object_name=rec.object,
-                    reason="stale state missing key",
-                    state_path=path,
-                    skip_drop=True,
+                    skip_postgres=True,
                 )
             )
             continue
@@ -204,26 +193,17 @@ def apply_drop_leases(
     for plan, lease in reserved:
         log(f"gc: {plan.reason} -> {plan.object_name or plan.key}")
         try:
-            # Lease owns skip_postgres (copied from plan.skip_drop at reserve).
-            if lease.skip_postgres:
-                finish_drop(lease)
-            else:
-                try:
-                    drop_key(cfg, secrets, lease.key)
-                except Exception as exc:
-                    abort_drop(lease)
-                    log(f"gc: drop failed for {lease.key}: {exc}")
-                    continue
-                finish_drop(lease)
-                log(
-                    f"gc: dropped {plan.object_name or object_name(lease.key)}"
-                )
-                if plan.object_name:
-                    dropped.append(plan.object_name)
+            if not lease.skip_postgres:
+                drop_key(cfg, secrets, lease.key)
+            finish_drop(lease)
         except Exception as exc:
             abort_drop(lease)
             log(f"gc: drop failed for {lease.key}: {exc}")
             continue
+        if not lease.skip_postgres:
+            log(f"gc: dropped {plan.object_name or object_name(lease.key)}")
+            if plan.object_name:
+                dropped.append(plan.object_name)
     return dropped
 
 
@@ -263,7 +243,7 @@ def gc(
     orphans = [
         p.object_name
         for p in plans
-        if not p.skip_drop and p.object_name
+        if not p.skip_postgres and p.object_name
     ]
     print(
         json.dumps(

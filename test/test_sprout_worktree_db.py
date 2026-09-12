@@ -189,10 +189,10 @@ class PlanOrphansTest(unittest.TestCase):
             plans = gc_mod.plan_orphans(state_data, live_paths, postgres)
             by_obj = {p.object_name: p for p in plans}
             self.assertIn("sprout_wt_app_gone", by_obj)
-            self.assertFalse(by_obj["sprout_wt_app_gone"].skip_drop)
+            self.assertFalse(by_obj["sprout_wt_app_gone"].skip_postgres)
             self.assertIn("sprout_wt_orphan_only", by_obj)
-            preview = next(p for p in plans if p.skip_drop and p.state_path)
-            self.assertTrue(preview.skip_drop)
+            preview = next(p for p in plans if p.skip_postgres and p.state_path)
+            self.assertTrue(preview.skip_postgres)
             self.assertNotIn("sprout_wt_app_live", by_obj)
 
     def test_live_objects_from_state_not_basename(self):
