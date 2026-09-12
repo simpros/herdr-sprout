@@ -353,6 +353,55 @@ class PackageLayoutTest(unittest.TestCase):
             leftovers = list(wt.glob(".sprout-provision-*"))
             self.assertEqual(leftovers, [])
 
+    def test_attach_preview_requires_canonical_not_slug(self):
+        """Slug-only match must not attach when canonical differs."""
+        from sprout_worktree_db.models import PluginConfig
+        from sprout_worktree_db.sprout import attach_preview
+
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = Path(tmp) / "feature"
+            wt.mkdir()
+            previews = {
+                "previews": [
+                    {
+                        "pr_id": 7,
+                        "canonical_repo_id": "other/repo",
+                        "slug": "myapp",
+                        "db_name": "sprout_other_pr7",
+                        "hostname": "https://preview.example",
+                    }
+                ]
+            }
+            cfg = PluginConfig(
+                repos=(
+                    repo(
+                        "myapp",
+                        canonical_repo_id="org/myapp",
+                        slug="myapp",
+                    ),
+                )
+            )
+            with mock.patch(
+                "sprout_worktree_db.sprout.branch_of", return_value="feat"
+            ), mock.patch(
+                "sprout_worktree_db.sprout.resolve_pr", return_value=7
+            ), mock.patch(
+                "sprout_worktree_db.sprout.sprout_cli",
+                return_value=(0, json.dumps(previews), ""),
+            ):
+                with self.assertRaises(RuntimeError) as ctx:
+                    attach_preview(
+                        cfg,
+                        {"SPROUT_PREVIEW_OWNER_URL": "postgres://u:p@h/db"},
+                        repo(
+                            "myapp",
+                            canonical_repo_id="org/myapp",
+                            slug="myapp",
+                        ),
+                        str(wt),
+                    )
+            self.assertIn("no sprout preview", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

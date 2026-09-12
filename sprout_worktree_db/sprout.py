@@ -129,15 +129,13 @@ def attach_preview(
             f"repos[] entry {repo.name!r} missing canonical_repo_id "
             "(required for attach-preview)"
         )
+    # Canonical only (plus optional .git suffix) — no silent slug fallback.
     target = next(
         (
             p
             for p in previews
             if p["pr_id"] == pr
-            and (
-                p["canonical_repo_id"] in (canonical, f"{canonical}.git")
-                or p["slug"] == repo.slug
-            )
+            and p["canonical_repo_id"] in (canonical, f"{canonical}.git")
         ),
         None,
     )

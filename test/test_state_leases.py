@@ -598,6 +598,81 @@ class SlugLeaseTest(unittest.TestCase):
             finally:
                 del os.environ["HERDR_PLUGIN_STATE_DIR"]
 
+    def test_finalize_keeps_lease_until_release(self):
+        """Provision lease fences env/steps; drop blocked until release_claim."""
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["HERDR_PLUGIN_STATE_DIR"] = tmp
+            try:
+                wt = str(Path(tmp) / "feature")
+                Path(wt).mkdir()
+                key, lease_id = state.claim_key(
+                    wt, repo("app"), mode="dedicated"
+                )
+                record = WorktreeRecord(
+                    key=key,
+                    repo="app",
+                    mode="dedicated",
+                    object=object_name(key),
+                    created_at="",
+                )
+                state.finalize_claim(wt, key, lease_id, record)
+                mid = state.load_state()
+                self.assertEqual(mid.worktrees[wt].object, object_name(key))
+                self.assertEqual(mid.leases[key].op, "provision")
+                self.assertEqual(
+                    state.claim_status(mid, mid.worktrees[wt]), "provisioning"
+                )
+                cfg = PluginConfig(repos=(repo("app"),))
+                with self.assertRaises(SystemExit) as ctx:
+                    state.begin_drop(cfg, wt)
+                self.assertIn("provision in progress", str(ctx.exception))
+
+                steps = [{"ok": True, "cmd": "migrate"}]
+                state.update_claim_steps(wt, key, lease_id, steps)
+                self.assertEqual(state.load_state().worktrees[wt].steps, steps)
+
+                state.release_claim(wt, key, lease_id)
+                after = state.load_state()
+                self.assertNotIn(key, after.leases)
+                self.assertEqual(
+                    state.claim_status(after, after.worktrees[wt]), "ready"
+                )
+                # Drop can proceed once the lease is gone.
+                lease = state.begin_drop(cfg, wt)
+                state.finish_drop(lease)
+                self.assertNotIn(wt, state.load_state().worktrees)
+            finally:
+                del os.environ["HERDR_PLUGIN_STATE_DIR"]
+
+    def test_update_claim_steps_rejects_wrong_lease(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["HERDR_PLUGIN_STATE_DIR"] = tmp
+            try:
+                wt = str(Path(tmp) / "feature")
+                Path(wt).mkdir()
+                key, lease_id = state.claim_key(
+                    wt, repo("app"), mode="dedicated"
+                )
+                state.finalize_claim(
+                    wt,
+                    key,
+                    lease_id,
+                    WorktreeRecord(
+                        key=key,
+                        repo="app",
+                        mode="dedicated",
+                        object=object_name(key),
+                        created_at="",
+                    ),
+                )
+                state.update_claim_steps(
+                    wt, key, lease_id + 1, [{"ok": True}]
+                )
+                self.assertEqual(state.load_state().worktrees[wt].steps, [])
+                state.release_claim(wt, key, lease_id)
+            finally:
+                del os.environ["HERDR_PLUGIN_STATE_DIR"]
+
 
 if __name__ == "__main__":
     unittest.main()

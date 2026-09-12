@@ -312,7 +312,11 @@ def claim_key(
 def finalize_claim(
     worktree: str, key: str, lease_id: int, record: WorktreeRecord
 ) -> None:
-    """Compare-and-swap provision result; clear the provision lease."""
+    """Compare-and-swap provision result; keep the provision lease.
+
+    The lease stays until ``release_claim`` so concurrent drop/GC cannot tear
+    down the object between finalize and deferred env merge / steps.
+    """
     with locked_state() as state:
         reclaim_expired_leases(state)
         claimed = state.worktrees.get(worktree)
@@ -339,7 +343,6 @@ def finalize_claim(
         if claimed.created_at:
             record.created_at = claimed.created_at
         state.worktrees[worktree] = record
-        state.leases.pop(key, None)
 
 
 def abort_claim(worktree: str, key: str, lease_id: int) -> None:
@@ -355,13 +358,33 @@ def abort_claim(worktree: str, key: str, lease_id: int) -> None:
         state.leases.pop(key, None)
 
 
-def update_claim_steps(worktree: str, key: str, steps: list[dict]) -> None:
-    """Persist step results after env merge (best-effort if claim still owned)."""
+def release_claim(worktree: str, key: str, lease_id: int) -> None:
+    """Lease-id-fenced pop after env merge + steps (or failure thereof)."""
+    with locked_state() as state:
+        lease = state.leases.get(key)
+        if (
+            lease is None
+            or lease.lease_id != lease_id
+            or lease.op != "provision"
+        ):
+            return
+        state.leases.pop(key, None)
+
+
+def update_claim_steps(
+    worktree: str, key: str, lease_id: int, steps: list[dict]
+) -> None:
+    """Persist step results while this provision lease still owns the slug."""
     with locked_state() as state:
         claimed = state.worktrees.get(worktree)
         if claimed is None or claimed.key != key:
             return
-        if claimed.key in state.leases:
+        lease = state.leases.get(key)
+        if (
+            lease is None
+            or lease.lease_id != lease_id
+            or lease.op != "provision"
+        ):
             return
         claimed.steps = list(steps)
 

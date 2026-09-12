@@ -17,8 +17,10 @@ class EnvInjection:
     """Connection credentials for worktree env files.
 
     ``pending_env`` is always set after a successful injection. Callers must
-    merge only after ``finalize_claim`` so a failed finalize cannot leave env
-    pointing at a new DSN while state still describes the prior claim.
+    merge only after ``finalize_claim`` (while the provision lease is still
+    held) so a failed finalize cannot leave env pointing at a new DSN while
+    state still describes the prior claim, and concurrent drop cannot race
+    the deferred merge.
     """
 
     object_name: str

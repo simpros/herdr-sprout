@@ -24,6 +24,7 @@ from sprout_worktree_db.state import (
     claim_key,
     finalize_claim,
     finish_drop,
+    release_claim,
     update_claim_steps,
 )
 from sprout_worktree_db.steps import run_steps
@@ -75,20 +76,24 @@ def do_provision(
             preview_url=injection.preview_url,
         )
         # Finalize gates disk truth: env + steps only after the claim sticks.
+        # Keep the provision lease through env/steps so drop/GC cannot race.
         finalize_claim(worktree, key, lease_id, record)
     except Exception:
         abort_claim(worktree, key, lease_id)
         raise
 
-    _apply_pending_env(injection)
-    steps = (
-        run_steps(cfg, secrets, repo, worktree)
-        if (req.with_steps and repo.steps)
-        else []
-    )
-    if steps:
-        record.steps = steps
-        update_claim_steps(worktree, key, steps)
+    try:
+        _apply_pending_env(injection)
+        steps = (
+            run_steps(cfg, secrets, repo, worktree)
+            if (req.with_steps and repo.steps)
+            else []
+        )
+        if steps:
+            record.steps = steps
+            update_claim_steps(worktree, key, lease_id, steps)
+    finally:
+        release_claim(worktree, key, lease_id)
 
     payload = record.to_dict()
     log(
