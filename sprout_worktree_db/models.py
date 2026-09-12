@@ -175,14 +175,15 @@ class WorktreeRecord:
 
 
 @dataclass(frozen=True)
-class DropReservation:
-    """Exclusive slug reservation while Postgres drop runs (or aborts).
+class DropLease:
+    """Exclusive slug reservation — persisted under ``dropping[key]``.
 
-    `worktrees` is the authoritative forget-set for this lease (every path
-    that currently holds the key, plus any remint path not yet in state).
+    ``worktrees`` is the authoritative forget-set. ``key`` is the map key when
+    stored; ``to_dict`` omits it. Executors use the returned handle (with key).
     """
 
     lease_id: int
+    key: str
     worktrees: tuple[str, ...]
     object_name: str
     skip_postgres: bool = False
@@ -200,11 +201,12 @@ class DropReservation:
         return data
 
     @classmethod
-    def from_dict(cls, key: str, data: dict | str) -> DropReservation:
+    def from_dict(cls, key: str, data: dict | str) -> DropLease:
         # Legacy: dropping[key] = worktree path string
         if isinstance(data, str):
             return cls(
                 lease_id=0,
+                key=key,
                 worktrees=(data,) if data else (),
                 object_name="",
                 reserved_at="",
@@ -226,6 +228,7 @@ class DropReservation:
             ) from exc
         return cls(
             lease_id=lease_id,
+            key=key,
             worktrees=tuple(str(p) for p in raw_wts if str(p)),
             object_name=str(data.get("object_name") or ""),
             skip_postgres=bool(data.get("skip_postgres")),
@@ -233,26 +236,11 @@ class DropReservation:
         )
 
 
-@dataclass(frozen=True)
-class DropLease:
-    """Handle returned by begin_drop / reserve — one owner per slug."""
-
-    lease_id: int
-    key: str
-    worktrees: tuple[str, ...]
-    object_name: str
-    skip_postgres: bool = False
-
-    @property
-    def worktree(self) -> str | None:
-        return self.worktrees[0] if self.worktrees else None
-
-
 @dataclass
 class PluginState:
     worktrees: dict[str, WorktreeRecord] = field(default_factory=dict)
-    # key → exclusive DropReservation while a drop lease holds the slug
-    dropping: dict[str, DropReservation] = field(default_factory=dict)
+    # key → exclusive DropLease while a drop holds the slug
+    dropping: dict[str, DropLease] = field(default_factory=dict)
     next_lease_id: int = 1
 
     def to_dict(self) -> dict:
@@ -275,6 +263,7 @@ class PluginState:
         if not isinstance(raw, dict):
             raise SystemExit("corrupt state.json: 'worktrees' must be an object")
         worktrees: dict[str, WorktreeRecord] = {}
+        by_key: dict[str, str] = {}
         for path, rec in raw.items():
             if not isinstance(rec, dict):
                 raise SystemExit(
@@ -285,13 +274,22 @@ class PluginState:
                     f"corrupt state.json: worktree {path!r} missing 'key' "
                     "(fix or remove the row)"
                 )
-            worktrees[str(path)] = WorktreeRecord.from_dict(rec)
+            path_s = str(path)
+            record = WorktreeRecord.from_dict(rec)
+            holder = by_key.get(record.key)
+            if holder is not None:
+                raise SystemExit(
+                    f"corrupt state.json: key {record.key!r} claimed by both "
+                    f"{holder!r} and {path_s!r}; drop/forget one row "
+                    "(one key → one path)"
+                )
+            by_key[record.key] = path_s
+            worktrees[path_s] = record
         raw_drop = data.get("dropping") or {}
         if raw_drop and not isinstance(raw_drop, dict):
             raise SystemExit("corrupt state.json: 'dropping' must be an object")
         dropping = {
-            str(k): DropReservation.from_dict(str(k), v)
-            for k, v in raw_drop.items()
+            str(k): DropLease.from_dict(str(k), v) for k, v in raw_drop.items()
         }
         try:
             next_id = int(data.get("next_lease_id") or 1)

@@ -413,7 +413,7 @@ class DropLeaseTest(unittest.TestCase):
     def test_plan_skips_dropping_rows(self):
         with tempfile.TemporaryDirectory() as tmp:
             gone = str(Path(tmp) / "gone")
-            from sprout_worktree_db.models import DropReservation
+            from sprout_worktree_db.models import DropLease
 
             st = PluginState(
                 worktrees={
@@ -426,8 +426,9 @@ class DropLeaseTest(unittest.TestCase):
                     )
                 },
                 dropping={
-                    "app-gone": DropReservation(
+                    "app-gone": DropLease(
                         lease_id=1,
+                        key="app-gone",
                         worktrees=(gone,),
                         object_name="sprout_wt_app_gone",
                         reserved_at="2099-01-01T00:00:00+00:00",
@@ -472,7 +473,7 @@ class DropLeaseTest(unittest.TestCase):
             try:
                 wt = str(Path(tmp) / "feature")
                 Path(wt).mkdir()
-                from sprout_worktree_db.models import DropReservation
+                from sprout_worktree_db.models import DropLease
 
                 st = PluginState(
                     worktrees={
@@ -485,8 +486,9 @@ class DropLeaseTest(unittest.TestCase):
                         )
                     },
                     dropping={
-                        "app-feature-abc12": DropReservation(
+                        "app-feature-abc12": DropLease(
                             lease_id=1,
+                            key="app-feature-abc12",
                             worktrees=(wt,),
                             object_name="sprout_wt_app_feature_abc12",
                             reserved_at="2099-01-01T00:00:00+00:00",
@@ -538,75 +540,30 @@ class DropLeaseTest(unittest.TestCase):
             finally:
                 del os.environ["HERDR_PLUGIN_STATE_DIR"]
 
-    def test_reserve_owns_full_forget_set(self):
-        """--worktree drop expands reservation to every path holding the key."""
-        with tempfile.TemporaryDirectory() as tmp:
-            os.environ["HERDR_PLUGIN_STATE_DIR"] = tmp
-            try:
-                a = str(Path(tmp) / "a")
-                b = str(Path(tmp) / "b")
-                Path(a).mkdir()
-                Path(b).mkdir()
-                # Legacy duplicate-key state (claim_key now prevents this).
-                st = PluginState(
-                    worktrees={
-                        a: WorktreeRecord(
-                            key="dup-key",
-                            repo="app",
-                            mode="dedicated",
-                            object="sprout_wt_dup_key",
-                            created_at="",
-                        ),
-                        b: WorktreeRecord(
-                            key="dup-key",
-                            repo="app",
-                            mode="dedicated",
-                            object="sprout_wt_dup_key",
-                            created_at="",
-                        ),
+    def test_duplicate_key_rejected_on_load(self):
+        """One key → one path: corrupt multi-path state fails closed."""
+        with self.assertRaises(SystemExit) as ctx:
+            PluginState.from_dict(
+                {
+                    "worktrees": {
+                        "/a": {
+                            "key": "dup",
+                            "repo": "app",
+                            "mode": "dedicated",
+                            "object": "sprout_wt_dup",
+                            "created_at": "",
+                        },
+                        "/b": {
+                            "key": "dup",
+                            "repo": "app",
+                            "mode": "dedicated",
+                            "object": "sprout_wt_dup",
+                            "created_at": "",
+                        },
                     }
-                )
-                state.save_state(st)
-                cfg = PluginConfig(repos=(_repo("app"),))
-                lease = state.begin_drop(cfg, a)
-                self.assertCountEqual(lease.worktrees, [a, b])
-                state.finish_drop(lease)
-                after = state.load_state()
-                self.assertNotIn(a, after.worktrees)
-                self.assertNotIn(b, after.worktrees)
-            finally:
-                del os.environ["HERDR_PLUGIN_STATE_DIR"]
-
-    def test_gc_skips_postgres_when_live_sibling(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            live = Path(tmp) / "live"
-            live.mkdir()
-            gone = str(Path(tmp) / "gone")
-            st = PluginState(
-                worktrees={
-                    str(live): WorktreeRecord(
-                        key="shared",
-                        repo="app",
-                        mode="dedicated",
-                        object="sprout_wt_shared",
-                        created_at="",
-                    ),
-                    gone: WorktreeRecord(
-                        key="shared",
-                        repo="app",
-                        mode="dedicated",
-                        object="sprout_wt_shared",
-                        created_at="",
-                    ),
                 }
             )
-            live_paths = {os.path.realpath(str(live))}
-            plans = gc_mod.plan_orphans(st, live_paths, ["sprout_wt_shared"])
-            self.assertEqual(plans, [])
-            pruned = state.prune_gone_sibling_rows(st, live_paths)
-            self.assertEqual(pruned, [gone])
-            self.assertIn(str(live), st.worktrees)
-            self.assertNotIn(gone, st.worktrees)
+        self.assertIn("claimed by both", str(ctx.exception))
 
     def test_expired_lease_reclaimed(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -614,7 +571,7 @@ class DropLeaseTest(unittest.TestCase):
             try:
                 wt = str(Path(tmp) / "feature")
                 Path(wt).mkdir()
-                from sprout_worktree_db.models import DropReservation
+                from sprout_worktree_db.models import DropLease
 
                 st = PluginState(
                     worktrees={
@@ -627,8 +584,9 @@ class DropLeaseTest(unittest.TestCase):
                         )
                     },
                     dropping={
-                        "app-feature-abc12": DropReservation(
+                        "app-feature-abc12": DropLease(
                             lease_id=1,
+                            key="app-feature-abc12",
                             worktrees=(wt,),
                             object_name="sprout_wt_app_feature_abc12",
                             reserved_at="2000-01-01T00:00:00+00:00",
@@ -653,7 +611,7 @@ class DropLeaseTest(unittest.TestCase):
             try:
                 wt = str(Path(tmp) / "feature")
                 Path(wt).mkdir()
-                from sprout_worktree_db.models import DropReservation
+                from sprout_worktree_db.models import DropLease
 
                 st = PluginState(
                     worktrees={
@@ -666,8 +624,9 @@ class DropLeaseTest(unittest.TestCase):
                         )
                     },
                     dropping={
-                        "app-feature-abc12": DropReservation(
+                        "app-feature-abc12": DropLease(
                             lease_id=1,
+                            key="app-feature-abc12",
                             worktrees=(wt,),
                             object_name="sprout_wt_app_feature_abc12",
                             reserved_at="2099-01-01T00:00:00+00:00",
@@ -683,6 +642,46 @@ class DropLeaseTest(unittest.TestCase):
                 self.assertEqual(lease.lease_id, 2)
                 state.finish_drop(lease)
                 self.assertNotIn(wt, state.load_state().worktrees)
+            finally:
+                del os.environ["HERDR_PLUGIN_STATE_DIR"]
+
+    def test_force_steals_on_remint_without_state_row(self):
+        """--force remint steals the reminted slug (no force_keys preamble)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["HERDR_PLUGIN_STATE_DIR"] = tmp
+            try:
+                wt = str(Path(tmp) / "feature")
+                Path(wt).mkdir()
+                from sprout_worktree_db.models import DropLease
+
+                key = mint_key(wt, _repo("myapp"))
+                # Stuck lease only — no worktrees row (remint recovery path).
+                st = PluginState(
+                    dropping={
+                        key: DropLease(
+                            lease_id=1,
+                            key=key,
+                            worktrees=(),
+                            object_name=object_name(key),
+                            reserved_at="2099-01-01T00:00:00+00:00",
+                        )
+                    },
+                    next_lease_id=2,
+                )
+                state.save_state(st)
+                cfg = PluginConfig(repos=(_repo("myapp"),))
+                with mock.patch(
+                    "sprout_worktree_db.state.repo_config",
+                    return_value=_repo("myapp"),
+                ):
+                    with self.assertRaises(SystemExit) as ctx:
+                        state.begin_drop(cfg, wt)
+                    self.assertIn("drop in progress", str(ctx.exception))
+                    lease = state.begin_drop(cfg, wt, force=True)
+                self.assertEqual(lease.key, key)
+                self.assertEqual(lease.lease_id, 2)
+                state.finish_drop(lease)
+                self.assertNotIn(key, state.load_state().dropping)
             finally:
                 del os.environ["HERDR_PLUGIN_STATE_DIR"]
 

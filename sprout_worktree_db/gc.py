@@ -14,11 +14,9 @@ from sprout_worktree_db.state import (
     expired_lease_keys,
     finish_drop,
     key_from_object,
-    key_has_live_sibling,
     load_state,
     locked_state,
     object_name,
-    prune_gone_sibling_rows,
     reclaim_expired_leases,
     reserve_from_plan,
 )
@@ -70,6 +68,7 @@ def plan_orphans(
     """Pure planning: state rows / postgres names with no live worktree.
 
     Rows / keys already under a drop lease are skipped (exclusive lease).
+    One key → one path is load-enforced; no sibling dialect.
     """
     plans: list[DropPlan] = []
     seen_objects: set[str] = set()
@@ -80,11 +79,6 @@ def plan_orphans(
         real = os.path.realpath(path) if path else ""
         path_gone = not os.path.exists(path) and real not in live_paths
         if not path_gone:
-            continue
-        # Live sibling still owns the slug — prune row elsewhere; never drop DB.
-        if rec.key and key_has_live_sibling(
-            state, rec.key, except_path=path, live_paths=live_paths
-        ):
             continue
         if rec.mode == "preview":
             plans.append(
@@ -175,13 +169,17 @@ def list_postgres_worktree_dbs(secrets: dict[str, str]) -> list[str] | None:
 def reserve_orphan_leases(
     live_paths: set[str],
     postgres_names: list[str] | None,
+    *,
+    steal_all: bool = False,
 ) -> tuple[list[DropPlan], list[tuple[DropPlan, DropLease]]]:
-    """Under one lock: reclaim expired leases, prune siblings, plan, reserve."""
+    """Under one lock: reclaim leases, plan orphans, reserve."""
     with locked_state() as state:
-        for key in reclaim_expired_leases(state):
-            log(f"gc: reclaimed expired drop lease for {key!r}")
-        for path in prune_gone_sibling_rows(state, live_paths):
-            log(f"gc: forgot gone sibling row {path} (live path still holds key)")
+        if steal_all:
+            for key in reclaim_expired_leases(state, force_all=True):
+                log(f"gc --reclaim-leases: cleared {key!r}")
+        else:
+            for key in reclaim_expired_leases(state):
+                log(f"gc: reclaimed expired drop lease for {key!r}")
         plans = plan_orphans(state, live_paths, postgres_names)
         reserved: list[tuple[DropPlan, DropLease]] = []
         for plan in plans:
@@ -206,7 +204,8 @@ def apply_drop_leases(
     for plan, lease in reserved:
         log(f"gc: {plan.reason} -> {plan.object_name or plan.key}")
         try:
-            if plan.skip_drop or lease.skip_postgres:
+            # Lease owns skip_postgres (copied from plan.skip_drop at reserve).
+            if lease.skip_postgres:
                 finish_drop(lease)
             else:
                 try:
@@ -240,15 +239,6 @@ def gc(
     live_paths = live_worktree_paths_for_config(cfg)
     postgres = list_postgres_worktree_dbs(secrets)
 
-    if reclaim_leases and not dry_run:
-        with locked_state() as state:
-            # Force-clear every stuck reservation (TTL or not).
-            cleared = reclaim_expired_leases(
-                state, force_keys=set(state.dropping)
-            )
-            for key in cleared:
-                log(f"gc --reclaim-leases: cleared {key!r}")
-
     if dry_run:
         st = load_state()
         for key in expired_lease_keys(st, all_leases=reclaim_leases):
@@ -258,7 +248,9 @@ def gc(
             log(f"gc: {plan.reason} -> {plan.object_name or plan.key}")
         dropped: list[str] = []
     else:
-        plans, reserved = reserve_orphan_leases(live_paths, postgres)
+        plans, reserved = reserve_orphan_leases(
+            live_paths, postgres, steal_all=reclaim_leases
+        )
         dropped = apply_drop_leases(cfg, secrets, reserved)
 
     if postgres is None:

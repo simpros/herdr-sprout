@@ -17,7 +17,6 @@ from sprout_worktree_db.gitutil import repo_config
 from sprout_worktree_db.models import (
     DropLease,
     DropPlan,
-    DropReservation,
     PluginConfig,
     PluginState,
     RepoConfig,
@@ -167,7 +166,7 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _lease_age_seconds(res: DropReservation, now: datetime) -> float | None:
+def _lease_age_seconds(res: DropLease, now: datetime) -> float | None:
     """Seconds since reserved_at, or None if unparseable. Missing → expired."""
     if not res.reserved_at:
         return None  # legacy / missing → reclaimable
@@ -183,20 +182,17 @@ def _lease_age_seconds(res: DropReservation, now: datetime) -> float | None:
 def reclaim_expired_leases(
     state: PluginState,
     *,
-    force_keys: set[str] | None = None,
+    force_all: bool = False,
     ttl_seconds: int = LEASE_TTL_SECONDS,
 ) -> list[str]:
-    """Pop expired (or force_keys) dropping entries. Returns cleared keys.
+    """Pop expired (or all, when force_all) dropping entries. Returns cleared keys.
 
     Abort-equivalent: claims stay in worktrees; only the reservation clears.
     """
     now = datetime.now(timezone.utc)
     cleared: list[str] = []
     for key, res in list(state.dropping.items()):
-        if force_keys is not None:
-            if key not in force_keys:
-                continue
-        else:
+        if not force_all:
             age = _lease_age_seconds(res, now)
             if age is not None and age < ttl_seconds:
                 continue
@@ -224,50 +220,8 @@ def expired_lease_keys(
 
 
 def paths_for_key(state: PluginState, key: str) -> tuple[str, ...]:
-    """Every state path that currently holds ``key`` (authoritative forget-set)."""
+    """Paths holding ``key`` (at most one under the one-key→one-path invariant)."""
     return tuple(p for p, r in state.worktrees.items() if r.key == key)
-
-
-def _path_is_live(path: str, live_paths: set[str]) -> bool:
-    real = os.path.realpath(path) if path else ""
-    return bool(path and (os.path.exists(path) or real in live_paths))
-
-
-def key_has_live_sibling(
-    state: PluginState,
-    key: str,
-    *,
-    except_path: str | None,
-    live_paths: set[str],
-) -> bool:
-    """True if another path still holds ``key`` and exists on disk / in live set."""
-    for path, rec in state.worktrees.items():
-        if rec.key != key:
-            continue
-        if except_path is not None and path == except_path:
-            continue
-        if _path_is_live(path, live_paths):
-            return True
-    return False
-
-
-def prune_gone_sibling_rows(
-    state: PluginState, live_paths: set[str]
-) -> list[str]:
-    """Forget gone paths whose key is still held by a live sibling (no postgres).
-
-    Does not take a drop lease — the live claim owns the slug.
-    """
-    pruned: list[str] = []
-    for path, rec in list(state.worktrees.items()):
-        if not rec.key or _path_is_live(path, live_paths):
-            continue
-        if key_has_live_sibling(
-            state, rec.key, except_path=path, live_paths=live_paths
-        ):
-            state.worktrees.pop(path, None)
-            pruned.append(path)
-    return pruned
 
 
 def claim_key(
@@ -362,7 +316,7 @@ def finalize_claim(
 def _forget_set(
     state: PluginState, key: str, extra: tuple[str, ...] = ()
 ) -> tuple[str, ...]:
-    """Authoritative forget-set: every path holding key, plus remint extras."""
+    """Forget-set: the (unique) path holding key, plus remint extras."""
     paths = list(paths_for_key(state, key))
     for p in extra:
         if p and p not in paths:
@@ -377,27 +331,27 @@ def _reserve(
     worktrees: tuple[str, ...],
     object_name: str,
     skip_postgres: bool,
+    steal: bool = False,
 ) -> DropLease | None:
-    """Exclusive slug reservation. Returns None if already reserved."""
+    """Exclusive slug reservation. Returns None if busy (unless steal)."""
     if key in state.dropping:
-        return None
+        if not steal:
+            return None
+        state.dropping.pop(key, None)
+        log(f"stole drop lease for {key!r}")
     lease_id = state.next_lease_id
     state.next_lease_id = lease_id + 1
     forget = _forget_set(state, key, worktrees)
-    state.dropping[key] = DropReservation(
-        lease_id=lease_id,
-        worktrees=forget,
-        object_name=object_name,
-        skip_postgres=skip_postgres,
-        reserved_at=_now_iso(),
-    )
-    return DropLease(
+    lease = DropLease(
         lease_id=lease_id,
         key=key,
         worktrees=forget,
         object_name=object_name,
         skip_postgres=skip_postgres,
+        reserved_at=_now_iso(),
     )
+    state.dropping[key] = lease
+    return lease
 
 
 def _resolve_and_reserve(
@@ -405,6 +359,8 @@ def _resolve_and_reserve(
     cfg: PluginConfig,
     worktree: str | None,
     requested: str | None,
+    *,
+    steal: bool = False,
 ) -> DropLease:
     """Single drop entrypoint: by --key, by worktree row, or remint recovery."""
     wt = os.path.realpath(worktree) if worktree else None
@@ -431,6 +387,7 @@ def _resolve_and_reserve(
             worktrees=extra,
             object_name=obj,
             skip_postgres=skip,
+            steal=steal,
         )
         if lease is None:
             raise SystemExit(f"key {key!r}: drop in progress")
@@ -448,6 +405,7 @@ def _resolve_and_reserve(
                 worktrees=(wt,),
                 object_name=obj,
                 skip_postgres=record.mode == "preview",
+                steal=steal,
             )
             if lease is None:
                 raise SystemExit(
@@ -464,6 +422,7 @@ def _resolve_and_reserve(
                 worktrees=(wt,),
                 object_name=object_name(key),
                 skip_postgres=False,
+                steal=steal,
             )
             if lease is None:
                 raise SystemExit(f"key {key!r}: drop in progress")
@@ -484,32 +443,26 @@ def begin_drop(
     requested: str | None = None,
     force: bool = False,
 ) -> DropLease:
-    """Reserve the slug under lock before slow Postgres drop (exclusive)."""
+    """Reserve the slug under lock before slow Postgres drop (exclusive).
+
+    ``force`` steals the target slug on reserve miss (after TTL reclaim), so
+    remint recovery works without guessing keys up front.
+    """
     with locked_state() as state:
-        if force:
-            force_keys: set[str] = set()
-            if requested:
-                nk = normalize_key(requested)
-                if nk:
-                    force_keys.add(nk)
-            wt = os.path.realpath(worktree) if worktree else None
-            if wt and wt in state.worktrees:
-                force_keys.add(state.worktrees[wt].key)
-            if force_keys:
-                cleared = reclaim_expired_leases(state, force_keys=force_keys)
-                for key in cleared:
-                    log(f"drop --force: reclaimed lease for {key!r}")
-            else:
-                reclaim_expired_leases(state)
-        else:
-            cleared = reclaim_expired_leases(state)
-            for key in cleared:
-                log(f"reclaimed expired drop lease for {key!r}")
-        return _resolve_and_reserve(state, cfg, worktree, requested)
+        for key in reclaim_expired_leases(state):
+            log(f"reclaimed expired drop lease for {key!r}")
+        return _resolve_and_reserve(
+            state, cfg, worktree, requested, steal=force
+        )
 
 
-def reserve_from_plan(state: PluginState, plan: DropPlan) -> DropLease | None:
-    """Reserve under an already-held lock (GC). None if slug busy / gone."""
+def reserve_from_plan(
+    state: PluginState, plan: DropPlan, *, steal: bool = False
+) -> DropLease | None:
+    """Reserve under an already-held lock (GC). None if slug busy / gone.
+
+    Planner owns ``skip_drop``; lease copies it once into ``skip_postgres``.
+    """
     if plan.state_path:
         rec = state.worktrees.get(plan.state_path)
         if rec is None:
@@ -522,7 +475,8 @@ def reserve_from_plan(state: PluginState, plan: DropPlan) -> DropLease | None:
             rec.key,
             worktrees=(plan.state_path,),
             object_name=obj,
-            skip_postgres=plan.skip_drop or rec.mode == "preview",
+            skip_postgres=plan.skip_drop,
+            steal=steal,
         )
     if not plan.key:
         return None
@@ -532,6 +486,7 @@ def reserve_from_plan(state: PluginState, plan: DropPlan) -> DropLease | None:
         worktrees=(),
         object_name=plan.object_name or object_name(plan.key),
         skip_postgres=plan.skip_drop,
+        steal=steal,
     )
 
 
@@ -540,7 +495,6 @@ def _clear_lease(state: PluginState, lease: DropLease, *, restore: bool) -> None
     if reserved is None or reserved.lease_id != lease.lease_id:
         return
     if not restore:
-        # Reservation owns the forget-set — no same-key scan.
         for path in reserved.worktrees:
             state.worktrees.pop(path, None)
     state.dropping.pop(lease.key, None)
