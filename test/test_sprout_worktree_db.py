@@ -18,7 +18,12 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from sprout_worktree_db import envfile, event, gc as gc_mod, state  # noqa: E402
-from sprout_worktree_db.models import PluginState, WorktreeRecord  # noqa: E402
+from sprout_worktree_db.models import (  # noqa: E402
+    PluginConfig,
+    PluginState,
+    RepoConfig,
+    WorktreeRecord,
+)
 from sprout_worktree_db.state import (  # noqa: E402
     mint_key,
     normalize_key,
@@ -27,6 +32,15 @@ from sprout_worktree_db.state import (  # noqa: E402
     stable_suffix,
 )
 from sprout_worktree_db import steps as steps_mod  # noqa: E402
+
+
+def _repo(name: str = "myapp", **kwargs) -> RepoConfig:
+    return RepoConfig(
+        name=name,
+        main_repo=kwargs.pop("main_repo", "/tmp/main"),
+        env_files=kwargs.pop("env_files", (".env",)),
+        **kwargs,
+    )
 
 
 class NormalizeKeyTest(unittest.TestCase):
@@ -67,11 +81,11 @@ class MintKeyTest(unittest.TestCase):
     def test_always_includes_stable_suffix(self):
         with tempfile.TemporaryDirectory() as tmp:
             wt = str(Path(tmp) / "feature")
-            key = mint_key(wt, {"name": "myapp"})
+            key = mint_key(wt, _repo("myapp"))
             self.assertEqual(key, f"myapp-feature-{stable_suffix(wt)}")
             self.assertLessEqual(len(key), 40)
             # Same path → same key; no collision branching.
-            self.assertEqual(key, mint_key(wt, {"name": "myapp"}))
+            self.assertEqual(key, mint_key(wt, _repo("myapp")))
 
     def test_distinct_paths_distinct_keys(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -80,8 +94,8 @@ class MintKeyTest(unittest.TestCase):
             Path(a).parent.mkdir(parents=True)
             Path(b).parent.mkdir(parents=True)
             self.assertNotEqual(
-                mint_key(a, {"name": "repo"}),
-                mint_key(b, {"name": "repo"}),
+                mint_key(a, _repo("repo")),
+                mint_key(b, _repo("repo")),
             )
 
     def test_resolve_prefers_existing_state(self):
@@ -99,12 +113,39 @@ class MintKeyTest(unittest.TestCase):
                 }
             )
             self.assertEqual(
-                resolve_key(st, wt, {"name": "myapp"}),
+                resolve_key(st, wt, _repo("myapp")),
                 "legacy-bare-key",
             )
+            # Matching --key after normalize is accepted.
             self.assertEqual(
-                resolve_key(st, wt, {"name": "myapp"}, requested="forced"),
-                "forced",
+                resolve_key(st, wt, _repo("myapp"), requested="Legacy-Bare-Key"),
+                "legacy-bare-key",
+            )
+
+    def test_resolve_rejects_conflicting_requested(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = str(Path(tmp) / "feature")
+            st = PluginState(
+                worktrees={
+                    wt: WorktreeRecord(
+                        key="legacy-bare-key",
+                        repo="myapp",
+                        mode="dedicated",
+                        object="sprout_wt_legacy_bare_key",
+                        created_at="2020-01-01T00:00:00+00:00",
+                    )
+                }
+            )
+            with self.assertRaises(SystemExit) as ctx:
+                resolve_key(st, wt, _repo("myapp"), requested="forced")
+            self.assertIn("already claimed", str(ctx.exception))
+
+    def test_resolve_normalizes_first_mint_requested(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = str(Path(tmp) / "feature")
+            self.assertEqual(
+                resolve_key(PluginState(), wt, _repo("myapp"), requested="Foo_Bar"),
+                "foo-bar",
             )
 
 
@@ -223,54 +264,137 @@ class EventPathTest(unittest.TestCase):
 class StepsSkipTest(unittest.TestCase):
     def test_missing_node_modules_is_not_ok(self):
         results = steps_mod.run_steps(
-            {},
+            PluginConfig(repos=(_repo(requires_node_modules=True, steps=(
+                {"cmd": ["echo", "hi"]},
+            )),)),
             {"SPROUT_WORKTREE_ADMIN_URL": "postgres://u:p@h/db"},
-            {"requires_node_modules": True, "steps": [["echo", "hi"]]},
+            _repo(requires_node_modules=True, steps=({"cmd": ["echo", "hi"]},)),
             "/tmp/nonexistent-worktree-xyz",
         )
         self.assertEqual(len(results), 1)
         self.assertFalse(results[0]["ok"])
         self.assertIn("skipped", results[0])
+        self.assertEqual(steps_mod.steps_status(results), "skipped")
+
+    def test_steps_status_ternary(self):
+        self.assertIsNone(steps_mod.steps_status([]))
+        self.assertEqual(
+            steps_mod.steps_status([{"ok": True}]),
+            "ok",
+        )
+        self.assertEqual(
+            steps_mod.steps_status([{"ok": False, "error": "boom"}]),
+            "failed",
+        )
+        self.assertEqual(
+            steps_mod.steps_status(
+                [{"ok": False, "skipped": "node_modules missing"}]
+            ),
+            "skipped",
+        )
 
 
-class DropKeyResolveTest(unittest.TestCase):
+class ReleaseKeyTest(unittest.TestCase):
     def test_fail_closed_without_state_or_repo(self):
-        from sprout_worktree_db.provision import _resolve_drop_key
-
+        cfg = PluginConfig(repos=())
+        # PluginConfig requires non-empty repos at from_dict, but we can
+        # construct empty for unit tests of release lookup.
         with self.assertRaises(SystemExit) as ctx:
-            _resolve_drop_key(
-                {"repos": []},
-                PluginState(),
-                "/tmp/ghost-wt",
-                None,
-                None,
-            )
+            state.release_key(cfg, "/tmp/ghost-wt", requested=None)
         self.assertIn("--key", str(ctx.exception))
 
     def test_remint_when_repo_known(self):
-        from sprout_worktree_db.provision import _resolve_drop_key
-
         with tempfile.TemporaryDirectory() as tmp:
             wt = str(Path(tmp) / "feature")
             Path(wt).mkdir()
             main = str(Path(tmp) / "main")
             Path(main).mkdir()
-            cfg = {
-                "repos": [
-                    {
-                        "name": "myapp",
-                        "main_repo": main,
-                        "env_files": [".env"],
-                    }
-                ]
-            }
-            # repo_config matches via worktrees under main — stub it.
+            cfg = PluginConfig(
+                repos=(_repo("myapp", main_repo=main, env_files=(".env",)),)
+            )
             with mock.patch(
-                "sprout_worktree_db.provision.repo_config",
-                return_value={"name": "myapp", "env_files": [".env"]},
+                "sprout_worktree_db.state.repo_config",
+                return_value=_repo("myapp"),
             ):
-                key = _resolve_drop_key(cfg, PluginState(), wt, None, None)
-            self.assertEqual(key, mint_key(wt, {"name": "myapp"}))
+                key, skip = state.release_key(cfg, wt)
+            self.assertFalse(skip)
+            self.assertEqual(key, mint_key(wt, _repo("myapp")))
+
+    def test_release_pops_under_lock_before_return(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["HERDR_PLUGIN_STATE_DIR"] = tmp
+            try:
+                wt = str(Path(tmp) / "feature")
+                Path(wt).mkdir()
+                st = PluginState(
+                    worktrees={
+                        wt: WorktreeRecord(
+                            key="app-feature-abc12",
+                            repo="app",
+                            mode="dedicated",
+                            object="sprout_wt_app_feature_abc12",
+                            created_at="",
+                        )
+                    }
+                )
+                state.save_state(st)
+                cfg = PluginConfig(repos=(_repo("app"),))
+                key, skip = state.release_key(cfg, wt)
+                self.assertEqual(key, "app-feature-abc12")
+                self.assertFalse(skip)
+                self.assertNotIn(wt, state.load_state().worktrees)
+            finally:
+                del os.environ["HERDR_PLUGIN_STATE_DIR"]
+
+    def test_only_if_key_skips_when_claim_changed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["HERDR_PLUGIN_STATE_DIR"] = tmp
+            try:
+                wt = str(Path(tmp) / "feature")
+                Path(wt).mkdir()
+                st = PluginState(
+                    worktrees={
+                        wt: WorktreeRecord(
+                            key="new-key",
+                            repo="app",
+                            mode="dedicated",
+                            object="sprout_wt_new_key",
+                            created_at="",
+                        )
+                    }
+                )
+                state.save_state(st)
+                cfg = PluginConfig(repos=(_repo("app"),))
+                key, skip = state.release_key(
+                    cfg, wt, only_if_key="old-key", only_if_object="sprout_wt_old"
+                )
+                self.assertIsNone(key)
+                self.assertTrue(skip)
+                self.assertIn(wt, state.load_state().worktrees)
+            finally:
+                del os.environ["HERDR_PLUGIN_STATE_DIR"]
+
+
+class PluginConfigTest(unittest.TestCase):
+    def test_requires_env_files(self):
+        with self.assertRaises(SystemExit) as ctx:
+            RepoConfig.from_dict(
+                {"name": "x", "main_repo": "/r", "env_files": []}
+            )
+        self.assertIn("env_files", str(ctx.exception))
+
+    def test_requires_name_and_main(self):
+        with self.assertRaises(SystemExit):
+            RepoConfig.from_dict({"main_repo": "/r", "env_files": [".env"]})
+        with self.assertRaises(SystemExit):
+            RepoConfig.from_dict({"name": "x", "env_files": [".env"]})
+
+    def test_corrupt_state_rejected(self):
+        with self.assertRaises(SystemExit) as ctx:
+            PluginState.from_dict(
+                {"worktrees": {"/wt": {"object": "sprout_wt_x"}}}
+            )
+        self.assertIn("missing 'key'", str(ctx.exception))
 
 
 class ConfigDirTest(unittest.TestCase):

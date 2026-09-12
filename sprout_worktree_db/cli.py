@@ -9,10 +9,11 @@ import os
 from sprout_worktree_db.event import event_worktree_path
 from sprout_worktree_db.gc import gc
 from sprout_worktree_db.gitutil import repo_config
-from sprout_worktree_db.models import DropRequest, ProvisionRequest
+from sprout_worktree_db.models import DropRequest, PluginConfig, ProvisionRequest
 from sprout_worktree_db.paths import load_config, load_secrets, log
 from sprout_worktree_db.provision import do_drop, do_provision
 from sprout_worktree_db.state import load_state
+from sprout_worktree_db.steps import steps_status
 
 _DOC = """Per-herdr-worktree Postgres databases via sprout.
 
@@ -43,13 +44,6 @@ def status() -> int:
     state = load_state()
     rows = []
     for path, rec in sorted(state.worktrees.items()):
-        steps = rec.steps
-        if not steps:
-            steps_ok = None
-        elif any(s.get("skipped") for s in steps):
-            steps_ok = False
-        else:
-            steps_ok = all(s.get("ok") for s in steps)
         rows.append(
             {
                 "worktree": path,
@@ -57,7 +51,7 @@ def status() -> int:
                 "key": rec.key,
                 "mode": rec.mode,
                 "database": rec.object,
-                "steps_ok": steps_ok,
+                "steps_status": steps_status(rec.steps),
             }
         )
     print(json.dumps({"worktrees": rows}, indent=2))
@@ -81,7 +75,7 @@ def hook(event: str) -> int:
             # Opt-in: competing .env-copy plugins have no ordering guarantee.
             # Default off — enable via config.auto_provision_on_create, or call
             # the ordered `provision` action after setup copies (see README).
-            if not cfg.get("auto_provision_on_create", False):
+            if not cfg.auto_provision_on_create:
                 log(
                     "hook created: auto_provision_on_create disabled "
                     "(set true in config.json, or run ordered provision action)"
@@ -109,7 +103,7 @@ def hook(event: str) -> int:
 
 
 def _provision_from_args(
-    cfg: dict,
+    cfg: PluginConfig,
     secrets: dict,
     worktree: str,
     *,

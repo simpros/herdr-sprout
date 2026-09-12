@@ -10,21 +10,35 @@ import urllib.parse
 from pathlib import Path
 
 from sprout_worktree_db.gitutil import run
+from sprout_worktree_db.models import PluginConfig, RepoConfig, StepsStatus
 from sprout_worktree_db.paths import clean_env, log, require_admin_url
 from sprout_worktree_db.sprout import target_name
 
 
-def run_steps(cfg: dict, secrets: dict, repo: dict, worktree: str) -> list[dict]:
+def steps_status(steps: list[dict]) -> StepsStatus | None:
+    """Ternary status: ok | skipped | failed (None when no steps ran)."""
+    if not steps:
+        return None
+    if any(s.get("skipped") for s in steps):
+        return "skipped"
+    if all(s.get("ok") for s in steps):
+        return "ok"
+    return "failed"
+
+
+def run_steps(
+    cfg: PluginConfig, secrets: dict, repo: RepoConfig, worktree: str
+) -> list[dict]:
     results: list[dict] = []
-    bun = cfg.get("bun") or shutil.which("bun") or "bun"
-    if repo.get("requires_node_modules") and not (
+    bun = cfg.bun or shutil.which("bun") or "bun"
+    if repo.requires_node_modules and not (
         Path(worktree) / "node_modules"
     ).exists():
         log(
             "steps skipped: node_modules missing "
             "(install deps, then re-run provision)"
         )
-        # Skips are not success — status must not report steps_ok: true.
+        # Skips are not success — status must surface steps_status: skipped.
         return [
             {
                 "step": "all",
@@ -43,8 +57,7 @@ def run_steps(cfg: dict, secrets: dict, repo: dict, worktree: str) -> list[dict]
         }
     )
     admin = urllib.parse.urlsplit(require_admin_url(secrets))
-    for raw_step in repo.get("steps", []):
-        step = {"cmd": raw_step} if isinstance(raw_step, list) else raw_step
+    for step in repo.steps:
         cmd = [bun if part == "{bun}" else part for part in step["cmd"]]
         env = dict(step_env)
         if step.get("as_admin"):

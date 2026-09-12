@@ -9,24 +9,18 @@ from datetime import datetime, timezone
 from sprout_worktree_db.gitutil import repo_config
 from sprout_worktree_db.models import (
     DropRequest,
-    PluginState,
+    PluginConfig,
     ProvisionRequest,
     WorktreeRecord,
 )
 from sprout_worktree_db.paths import config_path, log
-from sprout_worktree_db.state import (
-    claim_key,
-    locked_state,
-    load_state,
-    mint_key,
-    object_name,
-)
+from sprout_worktree_db.state import claim_key, locked_state, object_name, release_key
 from sprout_worktree_db.steps import run_steps
 from sprout_worktree_db.sprout import attach_preview, drop_key, provision_dedicated
 
 
 def do_provision(
-    cfg: dict, secrets: dict, req: ProvisionRequest
+    cfg: PluginConfig, secrets: dict, req: ProvisionRequest
 ) -> dict:
     worktree = os.path.realpath(req.worktree)
     repo = repo_config(cfg, worktree)
@@ -40,7 +34,7 @@ def do_provision(
         worktree, repo, mode=req.mode, requested=req.key
     )
     log(
-        f"provision [{req.mode}] worktree={worktree} key={key} repo={repo['name']}"
+        f"provision [{req.mode}] worktree={worktree} key={key} repo={repo.name}"
     )
 
     if req.mode == "preview":
@@ -50,12 +44,12 @@ def do_provision(
 
     steps = (
         run_steps(cfg, secrets, repo, worktree)
-        if (req.with_steps and repo.get("steps"))
+        if (req.with_steps and repo.steps)
         else []
     )
     record = WorktreeRecord(
         key=key,
-        repo=repo["name"],
+        repo=repo.name,
         mode=req.mode,
         object=injection.object_name,
         created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -84,58 +78,28 @@ def do_provision(
     return payload
 
 
-def do_drop(cfg: dict, secrets: dict, req: DropRequest) -> dict:
-    state = load_state()
+def do_drop(cfg: PluginConfig, secrets: dict, req: DropRequest) -> dict:
+    """Release state claim under lock, then drop Postgres (inverse of claim)."""
     worktree = os.path.realpath(req.worktree) if req.worktree else None
-    record = state.worktrees.get(worktree) if worktree else None
-
-    key = _resolve_drop_key(cfg, state, worktree, record, req.key)
-    shared = bool(record and record.mode == "preview")
-    if shared:
+    key, skip_drop = release_key(cfg, worktree, requested=req.key)
+    if key is None:
+        raise SystemExit("drop could not resolve a key")
+    if skip_drop:
         log(
-            f"worktree {worktree} shares preview DB {record.object}; "
-            "refusing to drop"
+            f"worktree {worktree} shares preview DB; refusing to drop"
         )
     elif not req.forget_only:
         drop_key(cfg, secrets, key)
         log(f"dropped {object_name(key)}")
-    if record and worktree:
-        with locked_state() as locked:
-            locked.worktrees.pop(worktree, None)
     print(
         json.dumps(
             {
                 "ok": True,
                 "key": key,
-                "dropped": not shared and not req.forget_only,
-                "refused_shared_preview": shared,
+                "dropped": not skip_drop and not req.forget_only,
+                "refused_shared_preview": skip_drop,
             },
             indent=2,
         )
     )
     return {"key": key}
-
-
-def _resolve_drop_key(
-    cfg: dict,
-    state: PluginState,
-    worktree: str | None,
-    record: WorktreeRecord | None,
-    requested: str | None,
-) -> str:
-    """Same identity rules as provision; fail closed without state or --key."""
-    if requested:
-        return requested
-    if record:
-        return record.key
-    if not worktree:
-        raise SystemExit("drop needs --worktree or --key")
-    repo = repo_config(cfg, worktree)
-    if repo:
-        # Honest recovery when state was wiped but path+repo still known:
-        # remint with the same always-suffix rule as provision.
-        return mint_key(worktree, repo)
-    raise SystemExit(
-        f"no state row for {worktree}; pass --key "
-        "(or ensure repo config matches so the slug can be reminted)"
-    )

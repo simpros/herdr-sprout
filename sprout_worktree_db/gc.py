@@ -7,22 +7,22 @@ import os
 import shutil
 
 from sprout_worktree_db.gitutil import git_worktree_paths, run
-from sprout_worktree_db.models import DropPlan, PluginState
+from sprout_worktree_db.models import DropPlan, PluginConfig, PluginState
 from sprout_worktree_db.paths import log, require_admin_url
 from sprout_worktree_db.state import (
     key_from_object,
     load_state,
-    locked_state,
     object_name,
+    release_key,
 )
 from sprout_worktree_db.sprout import drop_key
 
 
-def live_worktree_paths_for_config(cfg: dict) -> set[str]:
+def live_worktree_paths_for_config(cfg: PluginConfig) -> set[str]:
     """Union of `git worktree list` paths across configured repos."""
     live: set[str] = set()
-    for repo in cfg.get("repos", []):
-        main = os.path.expanduser(repo["main_repo"])
+    for repo in cfg.repos:
+        main = os.path.expanduser(repo.main_repo)
         live |= git_worktree_paths(main)
     return live
 
@@ -146,44 +146,58 @@ def list_postgres_worktree_dbs(secrets: dict[str, str]) -> list[str] | None:
 
 
 def apply_drop_plans(
-    cfg: dict,
+    cfg: PluginConfig,
     secrets: dict,
     plans: list[DropPlan],
     *,
     dry_run: bool = False,
 ) -> list[str]:
-    """Execute drop plans; return object names that were (or would be) dropped."""
+    """Execute drop plans; return object names that were (or would be) dropped.
+
+    For each plan with a state path: release (forget) under lock first — the
+    inverse of claim — then drop Postgres. Match guards skip when a concurrent
+    provision replaced the claim.
+    """
     dropped: list[str] = []
-    forget_paths: list[str] = []
     for plan in plans:
         log(f"gc: {plan.reason} -> {plan.object_name or plan.key}")
         if dry_run:
             if not plan.skip_drop and plan.object_name:
                 dropped.append(plan.object_name)
             continue
-        if not plan.skip_drop and plan.key:
+
+        should_drop = not plan.skip_drop and bool(plan.key)
+        if plan.state_path:
+            key, skip = release_key(
+                cfg,
+                plan.state_path,
+                only_if_key=plan.key or None,
+                only_if_object=plan.object_name or None,
+            )
+            if key is None:
+                log(
+                    f"gc: skip {plan.object_name or plan.key}; "
+                    "state claim changed under us"
+                )
+                continue
+            should_drop = not skip and not plan.skip_drop and bool(key)
+            drop_slug = key
+        else:
+            drop_slug = plan.key
+
+        if should_drop and drop_slug:
             try:
-                drop_key(cfg, secrets, plan.key)
-                log(f"gc: dropped {plan.object_name or object_name(plan.key)}")
+                drop_key(cfg, secrets, drop_slug)
+                log(f"gc: dropped {plan.object_name or object_name(drop_slug)}")
                 if plan.object_name:
                     dropped.append(plan.object_name)
             except Exception as exc:
-                log(f"gc: drop failed for {plan.key}: {exc}")
+                log(f"gc: drop failed for {drop_slug}: {exc}")
                 continue
-        if plan.state_path:
-            forget_paths.append(plan.state_path)
-    if not dry_run:
-        with locked_state() as state:
-            for path in forget_paths:
-                state.worktrees.pop(path, None)
-            # Also forget rows whose object was dropped as a postgres orphan.
-            for path, rec in list(state.worktrees.items()):
-                if rec.object in dropped:
-                    state.worktrees.pop(path, None)
     return dropped
 
 
-def gc(cfg: dict, secrets: dict, dry_run: bool = False) -> int:
+def gc(cfg: PluginConfig, secrets: dict, dry_run: bool = False) -> int:
     """Drop sprout_wt_* objects with no live worktree behind them."""
     require_admin_url(secrets)
     state = load_state()

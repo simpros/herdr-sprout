@@ -9,12 +9,12 @@ from pathlib import Path
 
 from sprout_worktree_db.envfile import merge_env_file, read_env_values
 from sprout_worktree_db.gitutil import branch_of, run
-from sprout_worktree_db.models import EnvInjection
+from sprout_worktree_db.models import EnvInjection, PluginConfig, RepoConfig
 from sprout_worktree_db.paths import clean_env, log, require_admin_url
 
 
-def resolve_sprout_cli(cfg: dict) -> str:
-    configured = cfg.get("cli")
+def resolve_sprout_cli(cfg: PluginConfig) -> str:
+    configured = cfg.cli
     if configured and Path(configured).exists():
         return configured
     found = shutil.which("sprout")
@@ -26,7 +26,9 @@ def resolve_sprout_cli(cfg: dict) -> str:
     )
 
 
-def sprout_cli(cfg: dict, secrets: dict, args: list[str]) -> tuple[int, str, str]:
+def sprout_cli(
+    cfg: PluginConfig, secrets: dict, args: list[str]
+) -> tuple[int, str, str]:
     cmd = [resolve_sprout_cli(cfg), *args]
     env = clean_env(
         {
@@ -37,12 +39,12 @@ def sprout_cli(cfg: dict, secrets: dict, args: list[str]) -> tuple[int, str, str
     return run(cmd, env=env)
 
 
-def target_name(repo: dict, logical: str) -> str:
-    return (repo.get("renames") or {}).get(logical, logical)
+def target_name(repo: RepoConfig, logical: str) -> str:
+    return repo.renames.get(logical, logical)
 
 
-def track_keys_for(repo: dict) -> set[str]:
-    return set((repo.get("renames") or {}).values()) | {
+def track_keys_for(repo: RepoConfig) -> set[str]:
+    return set(repo.renames.values()) | {
         "PGHOST",
         "PGPORT",
         "PGDATABASE",
@@ -53,14 +55,18 @@ def track_keys_for(repo: dict) -> set[str]:
 
 
 def provision_dedicated(
-    cfg: dict, secrets: dict, repo: dict, worktree: str, key: str
+    cfg: PluginConfig,
+    secrets: dict,
+    repo: RepoConfig,
+    worktree: str,
+    key: str,
 ) -> EnvInjection:
     """Provision once via sprout, then merge connection into each env file."""
     admin_url = require_admin_url(secrets)
     renames: list[str] = []
-    for logical, target in (repo.get("renames") or {}).items():
+    for logical, target in repo.renames.items():
         renames += ["--rename", f"{logical}={target}"]
-    env_files = [Path(worktree) / rel for rel in repo["env_files"]]
+    env_files = [Path(worktree) / rel for rel in repo.env_files]
     track_keys = track_keys_for(repo)
 
     # Provision against a scratch env file so sprout writes once; then merge
@@ -101,7 +107,7 @@ def provision_dedicated(
 
 
 def attach_preview(
-    cfg: dict, secrets: dict, repo: dict, worktree: str
+    cfg: PluginConfig, secrets: dict, repo: RepoConfig, worktree: str
 ) -> EnvInjection:
     """Point the worktree at the PR preview's database instead of a fresh one."""
     branch = branch_of(worktree)
@@ -114,7 +120,12 @@ def attach_preview(
     if rc != 0:
         raise RuntimeError(f"sprout list failed: {err or out}")
     previews = json.loads(out).get("previews", [])
-    canonical = repo["canonical_repo_id"]
+    canonical = repo.canonical_repo_id
+    if not canonical:
+        raise RuntimeError(
+            f"repos[] entry {repo.name!r} missing canonical_repo_id "
+            "(required for attach-preview)"
+        )
     target = next(
         (
             p
@@ -122,14 +133,14 @@ def attach_preview(
             if p["pr_id"] == pr
             and (
                 p["canonical_repo_id"] in (canonical, f"{canonical}.git")
-                or p["slug"] == repo.get("slug")
+                or p["slug"] == repo.slug
             )
         ),
         None,
     )
     if not target:
         raise RuntimeError(
-            f"no sprout preview registered for {repo['name']} PR/MR {pr}"
+            f"no sprout preview registered for {repo.name} PR/MR {pr}"
         )
     owner = secrets.get("SPROUT_PREVIEW_OWNER_URL", "").strip()
     if not owner:
@@ -148,7 +159,7 @@ def attach_preview(
             admin.password or ""
         ),
     }
-    env_files = [Path(worktree) / rel for rel in repo["env_files"]]
+    env_files = [Path(worktree) / rel for rel in repo.env_files]
     for env_file in env_files:
         merge_env_file(env_file, values)
     return EnvInjection(
@@ -159,10 +170,16 @@ def attach_preview(
     )
 
 
-def resolve_pr(repo: dict, branch: str) -> int | None:
+def resolve_pr(repo: RepoConfig, branch: str) -> int | None:
     """Open MR/PR number for a branch, via glab/gh."""
-    canonical = repo["canonical_repo_id"]
-    forge = repo.get("forge", "gitlab")
+    canonical = repo.canonical_repo_id
+    if not canonical:
+        log(
+            f"cannot resolve PR: repos[] entry {repo.name!r} "
+            "missing canonical_repo_id"
+        )
+        return None
+    forge = repo.forge
     slug = canonical.split("://", 1)[-1]
     if forge == "gitlab":
         # GitLab's API wants the project path WITHOUT the host.
@@ -210,7 +227,7 @@ def resolve_pr(repo: dict, branch: str) -> int | None:
     return int(data[0]["number"]) if data else None
 
 
-def drop_key(cfg: dict, secrets: dict, key: str) -> None:
+def drop_key(cfg: PluginConfig, secrets: dict, key: str) -> None:
     rc, out, err = sprout_cli(
         cfg,
         secrets,

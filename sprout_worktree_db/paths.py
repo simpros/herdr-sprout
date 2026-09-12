@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from sprout_worktree_db import PLUGIN_ID
+from sprout_worktree_db.models import PluginConfig
 
 LEGACY_CONFIG_DIR = Path.home() / ".config" / "sprout"
 
@@ -82,7 +83,7 @@ def log(msg: str) -> None:
         pass
 
 
-def load_config() -> dict:
+def load_config() -> PluginConfig:
     path = config_path()
     if not path.exists():
         raise SystemExit(
@@ -90,7 +91,8 @@ def load_config() -> dict:
             f"(see README; herdr plugin config-dir {PLUGIN_ID})"
         )
     with path.open() as fh:
-        return json.load(fh)
+        data = json.load(fh)
+    return PluginConfig.from_dict(data)
 
 
 def load_secrets() -> dict[str, str]:

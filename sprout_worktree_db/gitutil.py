@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import subprocess
 
+from sprout_worktree_db.models import PluginConfig, RepoConfig
 from sprout_worktree_db.paths import clean_env
 
 
@@ -55,19 +56,19 @@ def branch_of(worktree: str) -> str | None:
     return out.strip() if out else None
 
 
-def repo_config(cfg: dict, worktree: str) -> dict | None:
+def repo_config(cfg: PluginConfig, worktree: str) -> RepoConfig | None:
     main = main_repo_of(worktree) or ""
-    for repo in cfg.get("repos", []):
+    for repo in cfg.repos:
         if main and os.path.realpath(main) == os.path.realpath(
-            os.path.expanduser(repo["main_repo"])
+            os.path.expanduser(repo.main_repo)
         ):
             return repo
     worktree_real = os.path.realpath(worktree)
-    for repo in cfg.get("repos", []):
-        root = os.path.realpath(os.path.expanduser(repo["main_repo"]))
+    for repo in cfg.repos:
+        root = os.path.realpath(os.path.expanduser(repo.main_repo))
         if worktree_real.startswith(root + os.sep):
             return repo
-        wt_root = repo.get("worktrees_root")
+        wt_root = repo.worktrees_root
         if wt_root:
             wt_root = os.path.realpath(os.path.expanduser(wt_root))
             if worktree_real == wt_root or worktree_real.startswith(

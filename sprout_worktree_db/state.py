@@ -1,4 +1,4 @@
-"""State load/save and worktree key minting."""
+"""State load/save and worktree key minting / release."""
 
 from __future__ import annotations
 
@@ -13,7 +13,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
-from sprout_worktree_db.models import PluginState, WorktreeRecord
+from sprout_worktree_db.gitutil import repo_config
+from sprout_worktree_db.models import (
+    PluginConfig,
+    PluginState,
+    RepoConfig,
+    WorktreeRecord,
+)
 from sprout_worktree_db.paths import LEGACY_CONFIG_DIR, state_path
 
 
@@ -42,7 +48,7 @@ def stable_suffix(worktree: str) -> str:
     return digest[:5]
 
 
-def mint_key(worktree: str, repo: dict) -> str:
+def mint_key(worktree: str, repo: RepoConfig) -> str:
     """Always content-addressed: `{repo}-{basename}-{path-digest}` (max 40).
 
     No collision branching — first provision and re-provision agree when the
@@ -50,7 +56,7 @@ def mint_key(worktree: str, repo: dict) -> str:
     minting (see resolve_key).
     """
     basename = normalize_key(Path(worktree).name)
-    repo_slug = normalize_key(str(repo.get("name") or ""))
+    repo_slug = normalize_key(repo.name)
     if basename and repo_slug:
         qualified = normalize_key(f"{repo_slug}-{basename}")
         base = qualified or basename
@@ -69,15 +75,25 @@ def mint_key(worktree: str, repo: dict) -> str:
 def resolve_key(
     state: PluginState,
     worktree: str,
-    repo: dict,
+    repo: RepoConfig,
     requested: str | None = None,
 ) -> str:
-    """Single slug owner: explicit flag → existing state claim → mint."""
-    if requested:
-        return requested
+    """State owns the slug once claimed; --key only seeds a first mint."""
     existing = state.worktrees.get(worktree)
     if existing and existing.key:
+        if requested:
+            normalized = normalize_key(requested)
+            if requested != existing.key and normalized != existing.key:
+                raise SystemExit(
+                    f"{worktree} already claimed as {existing.key!r}; "
+                    f"drop/forget first, or omit --key (got {requested!r})"
+                )
         return existing.key
+    if requested:
+        key = normalize_key(requested)
+        if not key:
+            raise SystemExit(f"invalid --key: {requested!r}")
+        return key
     return mint_key(worktree, repo)
 
 
@@ -127,7 +143,7 @@ def locked_state() -> Iterator[PluginState]:
 
 def claim_key(
     worktree: str,
-    repo: dict,
+    repo: RepoConfig,
     *,
     mode: str,
     requested: str | None = None,
@@ -145,7 +161,7 @@ def claim_key(
         if previous and previous.key == key:
             claim = WorktreeRecord(
                 key=key,
-                repo=repo["name"],
+                repo=repo.name,
                 mode="preview" if mode == "preview" else "dedicated",
                 object=previous.object,
                 created_at=previous.created_at,
@@ -157,7 +173,7 @@ def claim_key(
         else:
             claim = WorktreeRecord(
                 key=key,
-                repo=repo["name"],
+                repo=repo.name,
                 mode="preview" if mode == "preview" else "dedicated",
                 object="",
                 created_at=datetime.now(timezone.utc).isoformat(
@@ -166,3 +182,72 @@ def claim_key(
             )
         state.worktrees[worktree] = claim
         return key, previous
+
+
+def release_key(
+    cfg: PluginConfig,
+    worktree: str | None,
+    *,
+    requested: str | None = None,
+    only_if_key: str | None = None,
+    only_if_object: str | None = None,
+) -> tuple[str | None, bool]:
+    """Inverse of claim_key: resolve + forget under lock, then caller drops.
+
+    Returns (key, skip_drop). ``key`` is None when ``only_if_*`` guards fail
+    (a concurrent re-provision replaced the claim — caller must not drop).
+
+    ``requested`` is the drop/forget escape hatch: forget every row with that
+    key and return it for ``drop_key``. Provision must not use this path.
+    """
+    with locked_state() as state:
+        wt = os.path.realpath(worktree) if worktree else None
+        record = state.worktrees.get(wt) if wt else None
+
+        if only_if_key is not None or only_if_object is not None:
+            if record is None:
+                # Already forgotten; still allow orphan drop via planned key.
+                return only_if_key, False
+            if only_if_key is not None and record.key != only_if_key:
+                return None, True
+            if (
+                only_if_object is not None
+                and record.object
+                and record.object != only_if_object
+            ):
+                return None, True
+            key = record.key
+            shared = record.mode == "preview"
+            assert wt is not None
+            state.worktrees.pop(wt, None)
+            return key, shared
+
+        if requested:
+            key = normalize_key(requested)
+            if not key:
+                raise SystemExit(f"invalid --key: {requested!r}")
+            shared = False
+            for path, rec in list(state.worktrees.items()):
+                if rec.key == key:
+                    shared = shared or rec.mode == "preview"
+                    state.worktrees.pop(path, None)
+            return key, shared
+
+        if record and wt:
+            key = record.key
+            shared = record.mode == "preview"
+            state.worktrees.pop(wt, None)
+            return key, shared
+
+        if not wt:
+            raise SystemExit("drop needs --worktree or --key")
+
+        repo = repo_config(cfg, wt)
+        if repo:
+            # Honest recovery when state was wiped but path+repo still known.
+            return mint_key(wt, repo), False
+
+        raise SystemExit(
+            f"no state row for {wt}; pass --key "
+            "(or ensure repo config matches so the slug can be reminted)"
+        )
