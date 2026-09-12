@@ -456,6 +456,47 @@ class SlugLeaseTest(unittest.TestCase):
             finally:
                 del os.environ["HERDR_PLUGIN_STATE_DIR"]
 
+    def test_force_does_not_steal_provision_lease(self):
+        """--force only steals stuck drop leases; provision stays exclusive."""
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["HERDR_PLUGIN_STATE_DIR"] = tmp
+            try:
+                wt = str(Path(tmp) / "feature")
+                Path(wt).mkdir()
+                key = "app-feature-abc12"
+                st = PluginState(
+                    worktrees={
+                        wt: WorktreeRecord(
+                            key=key,
+                            repo="app",
+                            mode="dedicated",
+                            object="",
+                            created_at="",
+                        )
+                    },
+                    leases={
+                        key: SlugLease(
+                            lease_id=1,
+                            key=key,
+                            op="provision",
+                            worktrees=(wt,),
+                            object_name="",
+                            touch_postgres=False,
+                            reserved_at="2099-01-01T00:00:00+00:00",
+                        )
+                    },
+                    next_lease_id=2,
+                )
+                state.save_state(st)
+                cfg = PluginConfig(repos=(repo("app"),))
+                with self.assertRaises(SystemExit) as ctx:
+                    state.begin_drop(cfg, wt, force=True)
+                self.assertIn("provision in progress", str(ctx.exception))
+                self.assertIn(key, state.load_state().leases)
+                self.assertEqual(state.load_state().leases[key].op, "provision")
+            finally:
+                del os.environ["HERDR_PLUGIN_STATE_DIR"]
+
     def test_force_steals_on_remint_without_state_row(self):
         """--force remint steals the reminted slug (no force_keys preamble)."""
         with tempfile.TemporaryDirectory() as tmp:

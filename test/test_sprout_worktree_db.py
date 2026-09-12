@@ -3,12 +3,14 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from _helpers import ROOT, SCRIPT, repo
 
@@ -307,6 +309,49 @@ class PackageLayoutTest(unittest.TestCase):
         # Required field: constructing without pending_env must fail.
         with self.assertRaises(TypeError):
             EnvInjection(object_name="x", env_files=())  # type: ignore[call-arg]
+
+    def test_no_drop_lease_alias(self):
+        import sprout_worktree_db.models as models
+
+        self.assertFalse(hasattr(models, "DropLease"))
+
+    def test_dedicated_scratch_outside_worktree(self):
+        """Scratch env must use system temp, not the checkout."""
+        from sprout_worktree_db.models import PluginConfig
+        from sprout_worktree_db.sprout import provision_dedicated
+
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = Path(tmp) / "feature"
+            wt.mkdir()
+            seen: list[str] = []
+
+            def fake_cli(cfg, secrets, argv):
+                env_idx = argv.index("--env-file") + 1
+                scratch = Path(argv[env_idx])
+                seen.append(str(scratch))
+                self.assertTrue(scratch.exists())
+                # Must not live under the worktree.
+                self.assertFalse(
+                    str(scratch.resolve()).startswith(str(wt.resolve()))
+                )
+                scratch.write_text("DATABASE_URL=postgres://x\n")
+                return 0, json.dumps({"object_name": "sprout_wt_k"}), ""
+
+            cfg = PluginConfig(repos=(repo("myapp"),))
+            with mock.patch(
+                "sprout_worktree_db.sprout.sprout_cli", side_effect=fake_cli
+            ), mock.patch(
+                "sprout_worktree_db.sprout.require_admin_url",
+                return_value="postgres://admin",
+            ):
+                inj = provision_dedicated(
+                    cfg, {}, repo("myapp"), str(wt), "myapp-feature-abc12"
+                )
+            self.assertEqual(len(seen), 1)
+            self.assertFalse(Path(seen[0]).exists())  # cleaned up
+            self.assertEqual(inj.pending_env.get("DATABASE_URL"), "postgres://x")
+            leftovers = list(wt.glob(".sprout-provision-*"))
+            self.assertEqual(leftovers, [])
 
 
 if __name__ == "__main__":

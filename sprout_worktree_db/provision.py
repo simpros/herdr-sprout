@@ -39,6 +39,8 @@ def do_provision(
     cfg: PluginConfig, secrets: dict, req: ProvisionRequest
 ) -> dict:
     worktree = os.path.realpath(req.worktree)
+    if not os.path.isdir(worktree):
+        raise SystemExit(f"{worktree}: worktree path is not a directory")
     repo = repo_config(cfg, worktree)
     if not repo:
         raise SystemExit(

@@ -283,10 +283,6 @@ class SlugLease:
         )
 
 
-# Back-compat alias used by older call sites / reviews.
-DropLease = SlugLease
-
-
 @dataclass
 class PluginState:
     worktrees: dict[str, WorktreeRecord] = field(default_factory=dict)

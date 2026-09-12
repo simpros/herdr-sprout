@@ -408,13 +408,18 @@ def _reserve(
     touch_postgres: bool,
     steal: bool = False,
 ) -> SlugLease | None:
-    """Exclusive drop-slug reservation. Returns None if busy (unless steal)."""
+    """Exclusive drop-slug reservation. Returns None if busy (unless steal).
+
+    ``steal`` only clears a stuck *drop* lease. In-flight provision leases
+    stay exclusive until TTL expiry or ``gc --reclaim-leases``.
+    """
     if key in state.leases:
-        if not steal:
+        existing = state.leases[key]
+        if not steal or existing.op != "drop":
             return None
         stolen = state.leases.pop(key, None)
         if stolen:
-            log(f"stole {stolen.op} lease for {key!r}")
+            log(f"stole drop lease for {key!r}")
     return _mint_lease(
         state,
         key,
@@ -514,9 +519,10 @@ def begin_drop(
 ) -> SlugLease:
     """Reserve the slug under lock before slow Postgres drop (exclusive).
 
-    ``force`` steals the target slug on reserve miss (after TTL reclaim), so
-    remint recovery works without guessing keys up front. ``forget_only``
-    encodes ``touch_postgres=False`` on the lease (no execute-time override).
+    ``force`` steals a stuck *drop* lease for the target slug (after TTL
+    reclaim), so remint recovery works without guessing keys up front.
+    Provision leases are not stolen — use TTL or ``gc --reclaim-leases``.
+    ``forget_only`` encodes ``touch_postgres=False`` on the lease.
     """
     with locked_state() as state:
         for key in reclaim_expired_leases(state):

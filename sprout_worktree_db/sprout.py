@@ -71,11 +71,9 @@ def provision_dedicated(
     env_files = [Path(worktree) / rel for rel in repo.env_files]
     track_keys = track_keys_for(repo)
 
-    # Scratch file so sprout writes once; pending_env merges after finalize.
-    wt_path = Path(worktree)
-    wt_path.mkdir(parents=True, exist_ok=True)
+    # System temp: credentials must not land in the worktree before finalize.
     fd, scratch_name = tempfile.mkstemp(
-        dir=str(wt_path), prefix=".sprout-provision-", suffix=".env"
+        prefix="sprout-provision-", suffix=".env"
     )
     os.close(fd)
     scratch = Path(scratch_name)
