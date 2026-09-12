@@ -11,7 +11,7 @@ from pathlib import Path
 from _helpers import ROOT  # noqa: F401 — ensures sys.path
 
 from sprout_worktree_db import gc as gc_mod
-from sprout_worktree_db.models import DropLease, PluginState, WorktreeRecord
+from sprout_worktree_db.models import PluginState, SlugLease, WorktreeRecord
 
 
 class PlanOrphansTest(unittest.TestCase):
@@ -54,10 +54,12 @@ class PlanOrphansTest(unittest.TestCase):
             plans = gc_mod.plan_orphans(state_data, live_paths, postgres)
             by_obj = {p.object_name: p for p in plans}
             self.assertIn("sprout_wt_app_gone", by_obj)
-            self.assertFalse(by_obj["sprout_wt_app_gone"].skip_postgres)
+            self.assertTrue(by_obj["sprout_wt_app_gone"].touch_postgres)
             self.assertIn("sprout_wt_orphan_only", by_obj)
-            preview = next(p for p in plans if p.skip_postgres and p.state_path)
-            self.assertTrue(preview.skip_postgres)
+            preview = next(
+                p for p in plans if not p.touch_postgres and p.state_path
+            )
+            self.assertFalse(preview.touch_postgres)
             self.assertNotIn("sprout_wt_app_live", by_obj)
 
     def test_live_objects_from_state_not_basename(self):
@@ -97,13 +99,14 @@ class PlanOrphansTest(unittest.TestCase):
                         created_at="",
                     )
                 },
-                dropping={
-                    "app-prev": DropLease(
+                leases={
+                    "app-prev": SlugLease(
                         lease_id=1,
                         key="app-prev",
+                        op="drop",
                         worktrees=(str(wt),),
                         object_name="",
-                        skip_postgres=True,
+                        touch_postgres=False,
                         reserved_at="2020-01-01T00:00:00+00:00",
                     )
                 },
@@ -118,11 +121,11 @@ class PlanOrphansTest(unittest.TestCase):
                 {os.path.realpath(str(wt))},
                 ["sprout_wt_app_prev"],
             )
-            # key app-prev is in dropping → postgres orphan skipped by lease
+            # key app-prev is in leases → postgres orphan skipped by lease
             self.assertEqual(plans, [])
             # Different orphan key still appears.
             plans2 = gc_mod.plan_orphans(
-                PluginState(dropping=state_data.dropping),
+                PluginState(leases=state_data.leases),
                 set(),
                 ["sprout_wt_other_orphan"],
             )
@@ -130,7 +133,7 @@ class PlanOrphansTest(unittest.TestCase):
                 [p.object_name for p in plans2], ["sprout_wt_other_orphan"]
             )
 
-    def test_plan_skips_dropping_rows(self):
+    def test_plan_skips_leased_rows(self):
         with tempfile.TemporaryDirectory() as tmp:
             gone = str(Path(tmp) / "gone")
             st = PluginState(
@@ -143,10 +146,11 @@ class PlanOrphansTest(unittest.TestCase):
                         created_at="",
                     )
                 },
-                dropping={
-                    "app-gone": DropLease(
+                leases={
+                    "app-gone": SlugLease(
                         lease_id=1,
                         key="app-gone",
+                        op="drop",
                         worktrees=(gone,),
                         object_name="sprout_wt_app_gone",
                         reserved_at="2099-01-01T00:00:00+00:00",

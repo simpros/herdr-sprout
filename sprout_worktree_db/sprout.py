@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import tempfile
 import urllib.parse
 from pathlib import Path
 
-from sprout_worktree_db.envfile import merge_env_file, read_env_values
+from sprout_worktree_db.envfile import read_env_values
 from sprout_worktree_db.gitutil import branch_of, run
 from sprout_worktree_db.models import EnvInjection, PluginConfig, RepoConfig
 from sprout_worktree_db.paths import clean_env, log, require_admin_url
@@ -61,7 +63,7 @@ def provision_dedicated(
     worktree: str,
     key: str,
 ) -> EnvInjection:
-    """Provision once via sprout, then merge connection into each env file."""
+    """Provision once via sprout into a scratch env; defer worktree merges."""
     admin_url = require_admin_url(secrets)
     renames: list[str] = []
     for logical, target in repo.renames.items():
@@ -69,41 +71,44 @@ def provision_dedicated(
     env_files = [Path(worktree) / rel for rel in repo.env_files]
     track_keys = track_keys_for(repo)
 
-    # Provision against a scratch env file so sprout writes once; then merge
-    # the resulting values into every configured path locally.
-    primary = env_files[0]
-    primary.parent.mkdir(parents=True, exist_ok=True)
-    primary.touch()
-    rc, out, err = sprout_cli(
-        cfg,
-        secrets,
-        [
-            "worktree-db",
-            "provision",
-            "--slug",
-            key,
-            "--env-file",
-            str(primary),
-            "--admin-url",
-            admin_url,
-            *renames,
-        ],
+    # Scratch file so sprout writes once; pending_env merges after finalize.
+    wt_path = Path(worktree)
+    wt_path.mkdir(parents=True, exist_ok=True)
+    fd, scratch_name = tempfile.mkstemp(
+        dir=str(wt_path), prefix=".sprout-provision-", suffix=".env"
     )
-    if rc != 0:
-        raise RuntimeError(
-            f"sprout worktree-db provision failed ({rc}): {err or out}"
+    os.close(fd)
+    scratch = Path(scratch_name)
+    try:
+        rc, out, err = sprout_cli(
+            cfg,
+            secrets,
+            [
+                "worktree-db",
+                "provision",
+                "--slug",
+                key,
+                "--env-file",
+                str(scratch),
+                "--admin-url",
+                admin_url,
+                *renames,
+            ],
         )
-    conn = json.loads(out)
-    written = read_env_values(primary, track_keys)
-    values = {k: v for k, v in written.items() if k in track_keys}
-
-    for env_file in env_files[1:]:
-        merge_env_file(env_file, values)
-
-    return EnvInjection(
-        object_name=conn["object_name"],
-        env_files=tuple(env_files),
-    )
+        if rc != 0:
+            raise RuntimeError(
+                f"sprout worktree-db provision failed ({rc}): {err or out}"
+            )
+        conn = json.loads(out)
+        written = read_env_values(scratch, track_keys)
+        values = {k: v for k, v in written.items() if k in track_keys}
+        return EnvInjection(
+            object_name=conn["object_name"],
+            env_files=tuple(env_files),
+            pending_env=values,
+        )
+    finally:
+        scratch.unlink(missing_ok=True)
 
 
 def attach_preview(
@@ -160,7 +165,6 @@ def attach_preview(
         ),
     }
     env_files = [Path(worktree) / rel for rel in repo.env_files]
-    # Defer merge until after finalize_claim (see do_provision).
     return EnvInjection(
         object_name=target["db_name"],
         env_files=tuple(env_files),

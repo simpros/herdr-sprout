@@ -58,7 +58,7 @@ class NormalizeKeyTest(unittest.TestCase):
             object="",
             created_at="",
         )
-        self.assertEqual(postgres_target(preview, "app-prev"), ("", True))
+        self.assertEqual(postgres_target(preview, "app-prev"), ("", False))
         dedicated = WorktreeRecord(
             key="app-feat",
             repo="app",
@@ -68,11 +68,11 @@ class NormalizeKeyTest(unittest.TestCase):
         )
         self.assertEqual(
             postgres_target(dedicated, "app-feat"),
-            ("sprout_wt_app_feat", False),
+            ("sprout_wt_app_feat", True),
         )
         self.assertEqual(
             postgres_target(None, "remint-key"),
-            ("sprout_wt_remint_key", False),
+            ("sprout_wt_remint_key", True),
         )
 
 
@@ -303,6 +303,10 @@ class PackageLayoutTest(unittest.TestCase):
         self.assertNotIn(
             "shared_with_preview", EnvInjection.__dataclass_fields__
         )
+        self.assertIn("pending_env", EnvInjection.__dataclass_fields__)
+        # Required field: constructing without pending_env must fail.
+        with self.assertRaises(TypeError):
+            EnvInjection(object_name="x", env_files=())  # type: ignore[call-arg]
 
 
 if __name__ == "__main__":

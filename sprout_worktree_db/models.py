@@ -9,21 +9,21 @@ from typing import Literal
 
 Mode = Literal["dedicated", "preview"]
 StepsStatus = Literal["ok", "skipped", "failed"]
+LeaseOp = Literal["provision", "drop"]
 
 
 @dataclass(frozen=True)
 class EnvInjection:
     """Connection credentials for worktree env files.
 
-    When ``pending_env`` is set, callers must merge after ``finalize_claim``
-    so a failed finalize cannot leave env pointing at a new DSN while state
-    still describes the prior claim. Dedicated provision writes via sprout
-    before finalize (``pending_env`` left None).
+    ``pending_env`` is always set after a successful injection. Callers must
+    merge only after ``finalize_claim`` so a failed finalize cannot leave env
+    pointing at a new DSN while state still describes the prior claim.
     """
 
     object_name: str
     env_files: tuple[Path, ...]
-    pending_env: dict[str, str] | None = None
+    pending_env: dict[str, str]
     pr_id: int | None = None
     preview_url: str | None = None
 
@@ -167,7 +167,7 @@ class WorktreeRecord:
 
     @classmethod
     def from_dict(cls, data: dict) -> WorktreeRecord:
-        # Legacy "status" field is ignored — derived from dropping membership.
+        # Legacy "status" field is ignored — derived from lease membership.
         return cls(
             key=str(data["key"]),
             repo=str(data.get("repo", "")),
@@ -182,82 +182,116 @@ class WorktreeRecord:
 
 
 @dataclass(frozen=True)
-class DropTarget:
-    """Resolved drop identity before reservation (by --key / row / remint)."""
+class DropOp:
+    """One drop identity for plan / resolve / reserve / execute.
+
+    ``touch_postgres`` is authoritative: ``--forget-only`` is encoded when the
+    op is created (False), not re-OR'd at execute time. ``paths`` is the
+    forget-set hint (claim path and/or remint extras); reserve expands via
+    ``path_for_key``.
+    """
 
     key: str
     object_name: str
-    skip_postgres: bool
-    extra_paths: tuple[str, ...] = ()
+    touch_postgres: bool
+    paths: tuple[str, ...] = ()
+    reason: str = ""
+
+    @property
+    def state_path(self) -> str | None:
+        return self.paths[0] if self.paths else None
 
 
 @dataclass(frozen=True)
-class DropLease:
-    """Exclusive slug reservation — persisted under ``dropping[key]``.
+class SlugLease:
+    """Exclusive slug reservation — persisted under ``leases[key]``.
 
-    ``worktrees`` is the authoritative forget-set. ``key`` is the map key when
-    stored; ``to_dict`` omits it. Executors use the returned handle (with key).
+    ``op`` is ``provision`` or ``drop``. ``worktrees`` is the authoritative
+    forget-set for drop. ``key`` is the map key when stored; ``to_dict`` omits
+    it. Executors use the returned handle (with key).
     """
 
     lease_id: int
     key: str
+    op: LeaseOp
     worktrees: tuple[str, ...]
-    object_name: str
-    skip_postgres: bool = False
+    object_name: str = ""
+    touch_postgres: bool = True
     reserved_at: str = ""  # ISO timestamp; missing → treat as expired
 
     def to_dict(self) -> dict:
         data = {
             "lease_id": self.lease_id,
+            "op": self.op,
             "worktrees": list(self.worktrees),
             "object_name": self.object_name,
-            "skip_postgres": self.skip_postgres,
+            "touch_postgres": self.touch_postgres,
         }
         if self.reserved_at:
             data["reserved_at"] = self.reserved_at
         return data
 
     @classmethod
-    def from_dict(cls, key: str, data: dict | str) -> DropLease:
+    def from_dict(cls, key: str, data: dict | str) -> SlugLease:
         # Legacy: dropping[key] = worktree path string
         if isinstance(data, str):
             return cls(
                 lease_id=0,
                 key=key,
+                op="drop",
                 worktrees=(data,) if data else (),
                 object_name="",
+                touch_postgres=True,
                 reserved_at="",
             )
         if not isinstance(data, dict):
             raise SystemExit(
-                f"corrupt state.json: dropping[{key!r}] must be an object"
+                f"corrupt state.json: leases[{key!r}] must be an object"
             )
         raw_wts = data.get("worktrees") or []
         if not isinstance(raw_wts, list):
             raise SystemExit(
-                f"corrupt state.json: dropping[{key!r}].worktrees must be a list"
+                f"corrupt state.json: leases[{key!r}].worktrees must be a list"
             )
         try:
             lease_id = int(data.get("lease_id", 0))
         except (TypeError, ValueError) as exc:
             raise SystemExit(
-                f"corrupt state.json: dropping[{key!r}].lease_id invalid"
+                f"corrupt state.json: leases[{key!r}].lease_id invalid"
             ) from exc
+        raw_op = data.get("op") or "drop"
+        if raw_op not in ("provision", "drop"):
+            raise SystemExit(
+                f"corrupt state.json: leases[{key!r}].op must be "
+                "'provision' or 'drop'"
+            )
+        if "touch_postgres" in data:
+            touch = bool(data["touch_postgres"])
+        elif "skip_postgres" in data:
+            # Legacy invert
+            touch = not bool(data["skip_postgres"])
+        else:
+            touch = raw_op == "drop"
         return cls(
             lease_id=lease_id,
             key=key,
+            op=raw_op,  # type: ignore[arg-type]
             worktrees=tuple(str(p) for p in raw_wts if str(p)),
             object_name=str(data.get("object_name") or ""),
-            skip_postgres=bool(data.get("skip_postgres")),
+            touch_postgres=touch,
             reserved_at=str(data.get("reserved_at") or ""),
         )
+
+
+# Back-compat alias used by older call sites / reviews.
+DropLease = SlugLease
 
 
 @dataclass
 class PluginState:
     worktrees: dict[str, WorktreeRecord] = field(default_factory=dict)
-    # key → exclusive DropLease while a drop holds the slug
-    dropping: dict[str, DropLease] = field(default_factory=dict)
+    # key → exclusive SlugLease (provision | drop)
+    leases: dict[str, SlugLease] = field(default_factory=dict)
     next_lease_id: int = 1
 
     def to_dict(self) -> dict:
@@ -266,9 +300,9 @@ class PluginState:
                 path: rec.to_dict() for path, rec in self.worktrees.items()
             }
         }
-        if self.dropping:
-            data["dropping"] = {
-                key: res.to_dict() for key, res in self.dropping.items()
+        if self.leases:
+            data["leases"] = {
+                key: res.to_dict() for key, res in self.leases.items()
             }
         if self.next_lease_id != 1:
             data["next_lease_id"] = self.next_lease_id
@@ -302,11 +336,17 @@ class PluginState:
                 )
             by_key[record.key] = path_s
             worktrees[path_s] = record
-        raw_drop = data.get("dropping") or {}
-        if raw_drop and not isinstance(raw_drop, dict):
-            raise SystemExit("corrupt state.json: 'dropping' must be an object")
-        dropping = {
-            str(k): DropLease.from_dict(str(k), v) for k, v in raw_drop.items()
+        # Prefer ``leases``; migrate legacy ``dropping`` (all op=drop).
+        raw_leases = data.get("leases")
+        if raw_leases is None:
+            raw_leases = data.get("dropping") or {}
+        if raw_leases and not isinstance(raw_leases, dict):
+            raise SystemExit(
+                "corrupt state.json: 'leases'/'dropping' must be an object"
+            )
+        leases = {
+            str(k): SlugLease.from_dict(str(k), v)
+            for k, v in (raw_leases or {}).items()
         }
         try:
             next_id = int(data.get("next_lease_id") or 1)
@@ -317,12 +357,10 @@ class PluginState:
         if next_id < 1:
             next_id = 1
         # Advance past any recovered lease ids.
-        for res in dropping.values():
+        for res in leases.values():
             if res.lease_id >= next_id:
                 next_id = res.lease_id + 1
-        return cls(
-            worktrees=worktrees, dropping=dropping, next_lease_id=next_id
-        )
+        return cls(worktrees=worktrees, leases=leases, next_lease_id=next_id)
 
 
 @dataclass(frozen=True)
@@ -339,14 +377,3 @@ class DropRequest:
     key: str | None = None
     forget_only: bool = False
     force: bool = False
-
-
-@dataclass(frozen=True)
-class DropPlan:
-    """One planned teardown: drop Postgres object and optionally forget state."""
-
-    key: str
-    object_name: str
-    reason: str
-    state_path: str | None = None
-    skip_postgres: bool = False  # preview / no object; forget_only is execute-time only

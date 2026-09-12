@@ -186,10 +186,11 @@ Herdr actions (from a workspace context): `provision`, `drop`, `gc`, `status`,
   (supports `--dry-run`) for orphan cleanup. With `psql` on `PATH`, `gc` also
   scans Postgres for `sprout_wt_*` orphans. Live objects are taken from **state**
   (never guessed from basename alone).
-- Drop takes an exclusive lease on the slug (`dropping` in state). A crash
-  mid-drop leaves the lease until it expires (1h TTL) or you reclaim it:
-  `drop --force --worktree …` / `gc --reclaim-leases`. Expired leases are also
-  cleared automatically on the next `provision` / `drop` / `gc`.
+- Drop and provision share one exclusive slug lease map (`leases` in state:
+  `op=provision|drop`). A crash mid-op leaves the lease until it expires (1h
+  TTL) or you reclaim it: `drop --force --worktree …` / `gc --reclaim-leases`.
+  Expired leases are also cleared automatically on the next
+  `provision` / `drop` / `gc`.
 - Each slug maps to at most one worktree path. GC never drops a DB while another
   live path still holds the same key (stale duplicate rows are forgotten only).
 

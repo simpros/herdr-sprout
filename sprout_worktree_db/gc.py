@@ -7,7 +7,7 @@ import os
 import shutil
 
 from sprout_worktree_db.gitutil import git_worktree_paths, run
-from sprout_worktree_db.models import DropLease, DropPlan, PluginConfig, PluginState
+from sprout_worktree_db.models import DropOp, PluginConfig, PluginState, SlugLease
 from sprout_worktree_db.paths import log, require_admin_url
 from sprout_worktree_db.provision import execute_drop_lease
 from sprout_worktree_db.state import (
@@ -39,20 +39,20 @@ def live_objects_from_state(
     State is the only source of truth for object names — never guess from
     basename alone. Active drop leases that will touch Postgres also count
     as live so concurrent GC does not double-plan them. Forget-only /
-    preview leases (``skip_postgres``) hold the slug only.
+    preview / provision leases hold the slug only.
     """
     live: set[str] = set()
     for path, rec in state.worktrees.items():
         real = os.path.realpath(path) if path else ""
         if not (os.path.exists(path) or real in live_paths):
             continue
-        if rec.key in state.dropping:
+        if rec.key in state.leases:
             continue
-        obj, skip = postgres_target(rec, rec.key)
-        if not skip and obj:
+        obj, touch = postgres_target(rec, rec.key)
+        if touch and obj:
             live.add(obj)
-    for key, res in state.dropping.items():
-        if res.skip_postgres:
+    for key, res in state.leases.items():
+        if res.op != "drop" or not res.touch_postgres:
             continue
         if res.object_name:
             live.add(res.object_name)
@@ -63,38 +63,38 @@ def plan_orphans(
     state: PluginState,
     live_paths: set[str],
     postgres_names: list[str] | None = None,
-) -> list[DropPlan]:
+) -> list[DropOp]:
     """Pure planning: state rows / postgres names with no live worktree.
 
-    Rows / keys already under a drop lease are skipped (exclusive lease).
+    Rows / keys already under a lease are skipped (exclusive lease).
     One key → one path is load-enforced; no sibling dialect.
     """
-    plans: list[DropPlan] = []
+    plans: list[DropOp] = []
     seen_objects: set[str] = set()
 
     for path, rec in list(state.worktrees.items()):
-        if rec.key in state.dropping:
+        if rec.key in state.leases:
             continue
         real = os.path.realpath(path) if path else ""
         path_gone = not os.path.exists(path) and real not in live_paths
         if not path_gone:
             continue
-        obj, skip = postgres_target(rec, rec.key)
+        obj, touch = postgres_target(rec, rec.key)
         reason = (
             "stale preview state"
-            if skip
+            if not touch
             else f"worktree gone ({path})"
         )
         plans.append(
-            DropPlan(
+            DropOp(
                 key=rec.key,
                 object_name=obj,
                 reason=reason,
-                state_path=path,
-                skip_postgres=skip,
+                paths=(path,),
+                touch_postgres=touch,
             )
         )
-        if not skip and obj:
+        if touch and obj:
             seen_objects.add(obj)
 
     live_objects = live_objects_from_state(state, live_paths)
@@ -110,19 +110,20 @@ def plan_orphans(
             key = key_from_object(obj)
             if not key:
                 continue
-            if key in state.dropping:
+            if key in state.leases:
                 continue
-            # A live claim owns the slug — never lease it as a state_path=None
+            # A live claim owns the slug — never lease it as a pathless
             # postgres orphan (that would finish_drop the claim). Leftover
             # dedicated DBs after a mode change are operator/drop territory.
             if path_for_key(state, key) is not None:
                 continue
             plans.append(
-                DropPlan(
+                DropOp(
                     key=key,
                     object_name=obj,
                     reason="postgres orphan (no state / live worktree)",
-                    state_path=None,
+                    paths=(),
+                    touch_postgres=True,
                 )
             )
             seen_objects.add(obj)
@@ -160,7 +161,7 @@ def reserve_orphan_leases(
     postgres_names: list[str] | None,
     *,
     reclaim_leases: bool = False,
-) -> tuple[list[DropPlan], list[tuple[DropPlan, DropLease]]]:
+) -> tuple[list[DropOp], list[tuple[DropOp, SlugLease]]]:
     """Under one lock: reclaim leases, plan orphans, reserve."""
     with locked_state() as state:
         if reclaim_leases:
@@ -168,9 +169,9 @@ def reserve_orphan_leases(
                 log(f"gc --reclaim-leases: cleared {key!r}")
         else:
             for key in reclaim_expired_leases(state):
-                log(f"gc: reclaimed expired drop lease for {key!r}")
+                log(f"gc: reclaimed expired lease for {key!r}")
         plans = plan_orphans(state, live_paths, postgres_names)
-        reserved: list[tuple[DropPlan, DropLease]] = []
+        reserved: list[tuple[DropOp, SlugLease]] = []
         for plan in plans:
             lease = reserve_from_plan(state, plan)
             if lease is None:
@@ -186,19 +187,13 @@ def reserve_orphan_leases(
 def apply_drop_leases(
     cfg: PluginConfig,
     secrets: dict,
-    reserved: list[tuple[DropPlan, DropLease]],
+    reserved: list[tuple[DropOp, SlugLease]],
 ) -> list[str]:
     """Execute reserved drop leases; return object names that were dropped."""
     dropped: list[str] = []
     for plan, lease in reserved:
         log(f"gc: {plan.reason} -> {lease.object_name or lease.key}")
-        ok = execute_drop_lease(
-            cfg,
-            secrets,
-            lease,
-            skip_postgres=lease.skip_postgres,
-            reraise=False,
-        )
+        ok = execute_drop_lease(cfg, secrets, lease, reraise=False)
         if ok:
             log(f"gc: dropped {lease.object_name or lease.key}")
             if lease.object_name:
@@ -242,7 +237,7 @@ def gc(
     orphans = [
         p.object_name
         for p in plans
-        if not p.skip_postgres and p.object_name
+        if p.touch_postgres and p.object_name
     ]
     print(
         json.dumps(
