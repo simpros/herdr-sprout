@@ -246,16 +246,16 @@ def claim_key(
     *,
     mode: Mode,
     requested: str | None = None,
-) -> tuple[str, WorktreeRecord | None]:
+) -> str:
     """Atomically resolve + persist a key claim before slow sprout work.
 
-    Returns (key, previous_record). Re-provision reuses the stored key so
-    passwords/objects stay stable even if mint rules change. One key maps to
-    at most one worktree path.
+    Re-provision reuses the stored key so passwords/objects stay stable even
+    if mint rules change. One key maps to at most one worktree path.
 
     Claim only reserves the key. On re-claim the existing row is left
-    untouched until ``finalize_claim`` writes mode/object — so mid-flight
-    mode flips cannot lie to ``postgres_target`` / drop / GC.
+    untouched until ``finalize_claim`` writes mode/object. In-place mode
+    changes are refused — drop first so dedicated ``sprout_wt_*`` teardown
+    stays on the drop/GC path (no dual-object-under-one-key).
     """
     with locked_state() as state:
         reclaim_expired_leases(state)
@@ -263,6 +263,11 @@ def claim_key(
         if previous and previous.key in state.dropping:
             raise SystemExit(
                 f"{worktree}: drop in progress for key {previous.key!r}"
+            )
+        if previous is not None and previous.mode != mode:
+            raise SystemExit(
+                f"{worktree} is {previous.mode}; "
+                f"drop first, then re-run for {mode}"
             )
         key = resolve_key(state, worktree, repo, requested)
         if key in state.dropping:
@@ -289,7 +294,7 @@ def claim_key(
                 created_at=_now_iso(),
             )
         # else: leave previous row untouched until finalize_claim
-        return key, previous
+        return key
 
 
 def finalize_claim(

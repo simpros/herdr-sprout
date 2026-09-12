@@ -6,10 +6,12 @@ import json
 import os
 from datetime import datetime, timezone
 
+from sprout_worktree_db.envfile import merge_env_file
 from sprout_worktree_db.gitutil import repo_config
 from sprout_worktree_db.models import (
     DropLease,
     DropRequest,
+    EnvInjection,
     PluginConfig,
     ProvisionRequest,
     WorktreeRecord,
@@ -26,6 +28,13 @@ from sprout_worktree_db.steps import run_steps
 from sprout_worktree_db.sprout import attach_preview, drop_key, provision_dedicated
 
 
+def _apply_pending_env(injection: EnvInjection) -> None:
+    if not injection.pending_env:
+        return
+    for env_file in injection.env_files:
+        merge_env_file(env_file, injection.pending_env)
+
+
 def do_provision(
     cfg: PluginConfig, secrets: dict, req: ProvisionRequest
 ) -> dict:
@@ -37,9 +46,7 @@ def do_provision(
             f"(add a repos[] entry with matching main_repo to {config_path()})"
         )
 
-    key, _previous = claim_key(
-        worktree, repo, mode=req.mode, requested=req.key
-    )
+    key = claim_key(worktree, repo, mode=req.mode, requested=req.key)
     log(
         f"provision [{req.mode}] worktree={worktree} key={key} repo={repo.name}"
     )
@@ -66,6 +73,9 @@ def do_provision(
         preview_url=injection.preview_url,
     )
     finalize_claim(worktree, key, record)
+    # Preview defers env merge until after finalize so a lost claim cannot
+    # leave env pointing at the preview DSN while state is still dedicated.
+    _apply_pending_env(injection)
 
     payload = record.to_dict()
     log(

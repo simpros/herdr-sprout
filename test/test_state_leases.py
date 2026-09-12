@@ -406,8 +406,8 @@ class DropLeaseTest(unittest.TestCase):
             finally:
                 del os.environ["HERDR_PLUGIN_STATE_DIR"]
 
-    def test_claim_preserves_mode_until_finalize(self):
-        """Re-claim must not flip mode before finalize (postgres_target stays honest)."""
+    def test_claim_refuses_mode_change(self):
+        """In-place dedicated↔preview is refused; drop first."""
         with tempfile.TemporaryDirectory() as tmp:
             os.environ["HERDR_PLUGIN_STATE_DIR"] = tmp
             try:
@@ -425,19 +425,41 @@ class DropLeaseTest(unittest.TestCase):
                     }
                 )
                 state.save_state(st)
-                key, previous = state.claim_key(
-                    wt, repo("app"), mode="preview"
-                )
-                self.assertEqual(key, "app-feature-abc12")
-                self.assertIsNotNone(previous)
+                with self.assertRaises(SystemExit) as ctx:
+                    state.claim_key(wt, repo("app"), mode="preview")
+                self.assertIn("drop first", str(ctx.exception))
                 mid = state.load_state()
                 rec = mid.worktrees[wt]
                 self.assertEqual(rec.mode, "dedicated")
                 self.assertEqual(rec.object, "sprout_wt_app_feature_abc12")
-                # Drop still sees dedicated postgres target mid-flight.
-                obj, skip = state.postgres_target(rec, rec.key)
-                self.assertEqual(obj, "sprout_wt_app_feature_abc12")
-                self.assertFalse(skip)
+            finally:
+                del os.environ["HERDR_PLUGIN_STATE_DIR"]
+
+    def test_claim_same_mode_leaves_row_until_finalize(self):
+        """Same-mode re-claim reserves the key without rewriting the row."""
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["HERDR_PLUGIN_STATE_DIR"] = tmp
+            try:
+                wt = str(Path(tmp) / "feature")
+                Path(wt).mkdir()
+                st = PluginState(
+                    worktrees={
+                        wt: WorktreeRecord(
+                            key="app-feature-abc12",
+                            repo="app",
+                            mode="dedicated",
+                            object="sprout_wt_app_feature_abc12",
+                            created_at="2020-01-01T00:00:00+00:00",
+                        )
+                    }
+                )
+                state.save_state(st)
+                key = state.claim_key(wt, repo("app"), mode="dedicated")
+                self.assertEqual(key, "app-feature-abc12")
+                mid = state.load_state()
+                rec = mid.worktrees[wt]
+                self.assertEqual(rec.mode, "dedicated")
+                self.assertEqual(rec.object, "sprout_wt_app_feature_abc12")
             finally:
                 del os.environ["HERDR_PLUGIN_STATE_DIR"]
 

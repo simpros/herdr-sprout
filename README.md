@@ -196,9 +196,10 @@ Herdr actions (from a workspace context): `provision`, `drop`, `gc`, `status`,
 ## Preview mode
 
 Worktrees are usually created before a PR exists, so a dedicated DB is the
-default. Once a preview deployment exists, `attach-preview` resolves
-branch → MR/PR → `sprout list` and points the env file at
-`sprout_<slug>_pr<id>` instead.
+default. Once a preview deployment exists, **drop** the dedicated claim first,
+then `attach-preview` (branch → MR/PR → `sprout list`) so the env file points
+at `sprout_<slug>_pr<id>`. In-place dedicated→preview switches are refused:
+the slug stays content-addressed, and drop is the only teardown of `sprout_wt_*`.
 
 ## Development
 

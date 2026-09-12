@@ -15,6 +15,7 @@ from sprout_worktree_db.state import (
     key_from_object,
     load_state,
     locked_state,
+    path_for_key,
     postgres_target,
     reclaim_expired_leases,
     reserve_from_plan,
@@ -110,6 +111,11 @@ def plan_orphans(
             if not key:
                 continue
             if key in state.dropping:
+                continue
+            # A live claim owns the slug — never lease it as a state_path=None
+            # postgres orphan (that would finish_drop the claim). Leftover
+            # dedicated DBs after a mode change are operator/drop territory.
+            if path_for_key(state, key) is not None:
                 continue
             plans.append(
                 DropPlan(

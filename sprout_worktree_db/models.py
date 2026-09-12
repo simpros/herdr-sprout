@@ -13,10 +13,17 @@ StepsStatus = Literal["ok", "skipped", "failed"]
 
 @dataclass(frozen=True)
 class EnvInjection:
-    """Result of writing connection credentials into worktree env files."""
+    """Connection credentials for worktree env files.
+
+    When ``pending_env`` is set, callers must merge after ``finalize_claim``
+    so a failed finalize cannot leave env pointing at a new DSN while state
+    still describes the prior claim. Dedicated provision writes via sprout
+    before finalize (``pending_env`` left None).
+    """
 
     object_name: str
     env_files: tuple[Path, ...]
+    pending_env: dict[str, str] | None = None
     pr_id: int | None = None
     preview_url: str | None = None
 

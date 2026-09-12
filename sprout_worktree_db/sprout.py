@@ -160,11 +160,11 @@ def attach_preview(
         ),
     }
     env_files = [Path(worktree) / rel for rel in repo.env_files]
-    for env_file in env_files:
-        merge_env_file(env_file, values)
+    # Defer merge until after finalize_claim (see do_provision).
     return EnvInjection(
         object_name=target["db_name"],
         env_files=tuple(env_files),
+        pending_env=values,
         pr_id=pr,
         preview_url=target.get("hostname"),
     )

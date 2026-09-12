@@ -156,6 +156,32 @@ class PlanOrphansTest(unittest.TestCase):
             plans = gc_mod.plan_orphans(st, set(), ["sprout_wt_app_gone"])
             self.assertEqual(plans, [])
 
+    def test_postgres_orphan_skipped_when_live_claim_owns_key(self):
+        """Live claim owns the slug — do not lease it as a pathless orphan."""
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = Path(tmp) / "feature"
+            wt.mkdir()
+            st = PluginState(
+                worktrees={
+                    str(wt): WorktreeRecord(
+                        key="app-feature",
+                        repo="app",
+                        mode="preview",
+                        object="sprout_shared_pr1",
+                        created_at="",
+                    )
+                }
+            )
+            plans = gc_mod.plan_orphans(
+                st,
+                {os.path.realpath(str(wt))},
+                ["sprout_wt_app_feature", "sprout_wt_true_orphan"],
+            )
+            by_obj = {p.object_name: p for p in plans}
+            self.assertNotIn("sprout_wt_app_feature", by_obj)
+            self.assertIn("sprout_wt_true_orphan", by_obj)
+            self.assertIsNone(by_obj["sprout_wt_true_orphan"].state_path)
+
 
 if __name__ == "__main__":
     unittest.main()
