@@ -121,6 +121,61 @@ class StateSchemaTest(unittest.TestCase):
         with self.assertRaises(CorruptStateError):
             PluginState.from_dict({"worktrees": {}, "leases": ["x"]})
 
+    def test_dedicated_empty_object_rejected(self):
+        """Dedicated claims must carry an object — no soft empty protocol."""
+        with self.assertRaises(CorruptStateError) as ctx:
+            PluginState.from_dict(
+                {
+                    "worktrees": {
+                        "/wt": {
+                            "key": "app-x",
+                            "repo": "app",
+                            "mode": "dedicated",
+                            "object": "",
+                            "created_at": "",
+                        }
+                    }
+                }
+            )
+        self.assertIn("object", str(ctx.exception))
+
+    def test_invalid_mode_rejected(self):
+        """Any non dedicated/preview mode fails closed (no silent default)."""
+        with self.assertRaises(CorruptStateError) as ctx:
+            PluginState.from_dict(
+                {
+                    "worktrees": {
+                        "/wt": {
+                            "key": "app-x",
+                            "repo": "app",
+                            "mode": "shared",
+                            "object": "sprout_wt_app_x",
+                            "created_at": "",
+                        }
+                    }
+                }
+            )
+        self.assertIn("mode", str(ctx.exception))
+
+    def test_non_object_step_row_rejected(self):
+        """Garbage step rows are corrupt — never coerced to empty rows."""
+        with self.assertRaises(CorruptStateError) as ctx:
+            PluginState.from_dict(
+                {
+                    "worktrees": {
+                        "/wt": {
+                            "key": "app-x",
+                            "repo": "app",
+                            "mode": "dedicated",
+                            "object": "sprout_wt_app_x",
+                            "created_at": "",
+                            "steps": ["migrate"],
+                        }
+                    }
+                }
+            )
+        self.assertIn("step rows must be objects", str(ctx.exception))
+
     def test_canonical_round_trip(self):
         st = PluginState.from_dict(
             {

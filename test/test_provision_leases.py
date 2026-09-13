@@ -50,7 +50,7 @@ class ProvisionLeaseTest(unittest.TestCase):
                     self.assertEqual(mid.leases[key].worktrees, (wt,))
                     cfg = PluginConfig(repos=(repo("app"),))
                     with self.assertRaises(PluginError) as ctx:
-                        begin_drop(cfg, wt)
+                        begin_drop(wt)
                     self.assertIn("provision in progress", str(ctx.exception))
                 # Session exit always releases the lease (abort ≡ release).
                 self.assertNotIn(key, state.load_state().leases)
@@ -247,7 +247,7 @@ class ProvisionLeaseTest(unittest.TestCase):
                     )
                     cfg = PluginConfig(repos=(repo("app"),))
                     with self.assertRaises(PluginError) as ctx:
-                        begin_drop(cfg, wt)
+                        begin_drop(wt)
                     self.assertIn("provision in progress", str(ctx.exception))
 
                     steps = [StepResult(step="migrate", ok=True)]
@@ -263,7 +263,7 @@ class ProvisionLeaseTest(unittest.TestCase):
                     state.claim_status(after, after.worktrees[wt]), "ready"
                 )
                 # Drop can proceed once the lease is gone.
-                lease = begin_drop(cfg, wt)
+                lease = begin_drop(wt)
                 finish_drop(lease)
                 self.assertNotIn(wt, state.load_state().worktrees)
             finally:

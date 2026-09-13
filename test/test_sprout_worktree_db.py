@@ -56,6 +56,8 @@ class NormalizeKeyTest(unittest.TestCase):
 
     def test_postgres_target_unified(self):
         """--key and --worktree must agree for the same claim."""
+        from sprout_worktree_db.errors import CorruptStateError
+
         preview = WorktreeRecord(
             key="app-prev",
             repo="app",
@@ -68,13 +70,24 @@ class NormalizeKeyTest(unittest.TestCase):
             key="app-feat",
             repo="app",
             mode="dedicated",
-            object="",
+            object="sprout_wt_app_feat",
             created_at="",
         )
         self.assertEqual(
             postgres_target(dedicated, "app-feat"),
             ("sprout_wt_app_feat", True),
         )
+        # Fail closed: dedicated claims must carry an object — no silent
+        # invention of object_name(key) next to the strict lease contract.
+        bare = WorktreeRecord(
+            key="app-feat",
+            repo="app",
+            mode="dedicated",
+            object="",
+            created_at="",
+        )
+        with self.assertRaises(CorruptStateError):
+            postgres_target(bare, "app-feat")
         self.assertEqual(
             postgres_target(None, "remint-key"),
             ("sprout_wt_remint_key", True),

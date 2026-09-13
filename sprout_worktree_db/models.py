@@ -249,10 +249,7 @@ class WorktreeRecord:
             "object": self.object,
             "created_at": self.created_at,
             "env_files": list(self.env_files),
-            "steps": [
-                s.to_dict() if isinstance(s, StepResult) else dict(s)
-                for s in self.steps
-            ],
+            "steps": [s.to_dict() for s in self.steps],
         }
         if self.pr_id is not None:
             data["pr_id"] = self.pr_id
@@ -263,17 +260,41 @@ class WorktreeRecord:
     @classmethod
     def from_dict(cls, data: dict) -> WorktreeRecord:
         # Legacy "status" field is ignored — derived from lease membership.
+        if not data.get("key"):
+            raise CorruptStateError(
+                "corrupt state.json: worktree row missing 'key' "
+                "(fix or remove the row)"
+            )
+        raw_mode = data.get("mode")
+        if raw_mode not in ("dedicated", "preview"):
+            raise CorruptStateError(
+                f"corrupt state.json: worktree {data.get('key')!r} has "
+                f"invalid mode {raw_mode!r} (expected 'dedicated'/'preview')"
+            )
+        mode: Mode = "preview" if raw_mode == "preview" else "dedicated"
+        obj = str(data.get("object") or "")
+        if mode == "dedicated" and not obj:
+            raise CorruptStateError(
+                f"corrupt state.json: dedicated claim {data.get('key')!r} "
+                "missing 'object' (fix or remove the row)"
+            )
         raw_steps = data.get("steps") or []
-        steps = [
-            s if isinstance(s, StepResult)
-            else StepResult.from_dict(s if isinstance(s, dict) else {})
-            for s in raw_steps
-        ]
+        if not isinstance(raw_steps, list):
+            raise CorruptStateError(
+                "corrupt state.json: step rows must be a list"
+            )
+        steps: list[StepResult] = []
+        for s in raw_steps:
+            if not isinstance(s, dict):
+                raise CorruptStateError(
+                    "corrupt state.json: step rows must be objects"
+                )
+            steps.append(StepResult.from_dict(s))
         return cls(
             key=str(data["key"]),
             repo=str(data.get("repo", "")),
-            mode="preview" if data.get("mode") == "preview" else "dedicated",
-            object=str(data.get("object", "")),
+            mode=mode,
+            object=obj,
             created_at=str(data.get("created_at", "")),
             env_files=list(data.get("env_files") or []),
             steps=steps,

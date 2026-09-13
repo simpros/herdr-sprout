@@ -19,9 +19,7 @@ from datetime import datetime, timezone
 from typing import Iterator
 
 from sprout_worktree_db.errors import BusyError, ConfigError, SproutError
-from sprout_worktree_db.gitutil import repo_config
 from sprout_worktree_db.keys import (
-    mint_key,
     normalize_key,
     postgres_target,
     resolve_key,
@@ -30,7 +28,6 @@ from sprout_worktree_db.models import (
     DropOp,
     LeaseOp,
     Mode,
-    PluginConfig,
     PluginState,
     RepoConfig,
     SlugLease,
@@ -39,7 +36,6 @@ from sprout_worktree_db.models import (
 )
 from sprout_worktree_db.paths import log
 from sprout_worktree_db.state import (
-    load_state,
     locked_state,
     path_for_key,
     reclaim_expired_leases,
@@ -319,10 +315,14 @@ def _drop_target(
     """Resolve drop identity: by --key, by worktree row, or remint recovery.
 
     Pure state lookup — no I/O. Remint inputs (``remint_key``) are resolved
-    by the caller *before* taking the lock because ``repo_config`` runs
-    ``git worktree list``. ``forget_only`` is encoded here, once, as
-    ``touch_postgres=False`` — the op owns the flag from creation; no
-    caller overrides it afterwards.
+    by the caller *before* taking the lock (see ``drop.remint_key_for``).
+    ``forget_only`` is encoded here, once, as ``touch_postgres=False`` —
+    the op owns the flag from creation; no caller overrides it afterwards.
+
+    ``--key`` is authoritative when given: the forget-set is only
+    ``path_for_key(key)`` — never the caller's worktree. Passing both
+    flags requires agreement (fail closed) so a key-resolved drop can
+    never pop a foreign claim via ``finish_drop``.
     """
     wt = worktree
 
@@ -337,8 +337,13 @@ def _drop_target(
     if requested_key is not None:
         path = path_for_key(state, requested_key)
         rec = state.worktrees[path] if path else None
+        if wt is not None and path != wt:
+            raise ConfigError(
+                f"drop --key {requested_key!r} does not own {wt} "
+                f"(owns {path!r}); pass only one of --key / --worktree"
+            )
         obj, touch = postgres_target(rec, requested_key)
-        return _bake(requested_key, obj, touch, (wt,) if wt else ())
+        return _bake(requested_key, obj, touch, ())
 
     if wt is not None:
         record = state.worktrees.get(wt)
@@ -396,12 +401,12 @@ def _resolve_and_reserve(
 
 
 def begin_drop(
-    cfg: PluginConfig,
     worktree: str | None = None,
     *,
     requested: str | None = None,
     force: bool = False,
     forget_only: bool = False,
+    remint_key: str | None = None,
 ) -> SlugLease:
     """Reserve the slug under lock before slow Postgres drop (exclusive).
 
@@ -410,16 +415,12 @@ def begin_drop(
     Provision leases are not stolen — use TTL or ``gc --reclaim-leases``.
     ``forget_only`` encodes ``touch_postgres=False`` on the lease.
 
-    Remint inputs are resolved *before* the lock: ``repo_config`` shells
+    Pure mutation layer: remint inputs arrive via ``remint_key`` (resolved
+    by ``drop.remint_key_for`` outside the flock — ``repo_config`` shells
     out to ``git worktree list``, which must never run while holding the
-    exclusive state flock (a hung git would stall every other writer).
-    ``_drop_target`` under the lock is then a pure state lookup; a row
-    created concurrently still wins because the lock re-checks state.
-
-    Remint is recovery-only: when a state row already owns the worktree,
-    no git runs at all (checked lock-free first). The concurrent-create
-    race (row appears after the check) only wastes one git call — the
-    lock still prefers the row and ignores the unused remint.
+    exclusive state flock). ``_drop_target`` under the lock is then a pure
+    state lookup; a row created concurrently still wins because the lock
+    re-checks state.
     """
     wt = os.path.realpath(worktree) if worktree else None
     requested_key: str | None = None
@@ -429,15 +430,6 @@ def begin_drop(
             raise ConfigError(f"invalid --key: {requested!r}")
     if wt is None and requested_key is None:
         raise ConfigError("drop needs --worktree or --key")
-    remint_key: str | None = None
-    if wt is not None and requested_key is None:
-        # Fast path: a tracked row needs no remint — skip git entirely.
-        # Lock-free read only; the lock below re-checks state, so a
-        # concurrently created row still wins (remint goes unused).
-        if load_state().worktrees.get(wt) is None:
-            repo = repo_config(cfg, wt)
-            if repo is not None:
-                remint_key = mint_key(wt, repo)
     with locked_state() as state:
         for key in reclaim_expired_leases(state):
             log(f"reclaimed expired lease for {key!r}")

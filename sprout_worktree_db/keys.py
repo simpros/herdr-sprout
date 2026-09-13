@@ -12,7 +12,11 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from sprout_worktree_db.errors import BusyError, ConfigError
+from sprout_worktree_db.errors import (
+    BusyError,
+    ConfigError,
+    CorruptStateError,
+)
 from sprout_worktree_db.models import RepoConfig, WorktreeRecord
 
 if TYPE_CHECKING:
@@ -35,12 +39,24 @@ def object_name(key: str) -> str:
 def postgres_target(
     rec: WorktreeRecord | None, key: str
 ) -> tuple[str, bool]:
-    """(object_name, touch_postgres) — single rule for drop + GC."""
+    """(object_name, touch_postgres) — single rule for drop + GC.
+
+    Fail-closed: a dedicated claim must carry a non-empty ``object``
+    (enforced on load); inventing ``object_name(key)`` here would revive
+    the soft empty-object protocol next to the strict lease contract.
+    ``rec=None`` is the remint path (no row yet) and still derives the
+    conventional name.
+    """
     if rec is None:
         return object_name(key), True
     if rec.mode == "preview":
         return (rec.object or ""), False
-    return (rec.object or object_name(rec.key)), True
+    if not rec.object:
+        raise CorruptStateError(
+            f"corrupt state.json: dedicated claim {rec.key!r} "
+            "missing 'object' (fix or remove the row)"
+        )
+    return rec.object, True
 
 
 def key_from_object(obj: str) -> str | None:

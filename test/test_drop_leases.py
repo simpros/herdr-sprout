@@ -33,10 +33,12 @@ class DropLeaseTest(unittest.TestCase):
     def test_fail_closed_without_state_or_repo(self):
         cfg = PluginConfig(repos=())
         with self.assertRaises(PluginError) as ctx:
-            begin_drop(cfg, "/tmp/ghost-wt", requested=None)
+            begin_drop("/tmp/ghost-wt", requested=None)
         self.assertIn("--key", str(ctx.exception))
 
     def test_remint_when_repo_known(self):
+        from sprout_worktree_db.drop import remint_key_for
+
         with tempfile.TemporaryDirectory() as tmp:
             os.environ["HERDR_PLUGIN_STATE_DIR"] = tmp
             try:
@@ -48,10 +50,12 @@ class DropLeaseTest(unittest.TestCase):
                     repos=(repo("myapp", main_repo=main, env_files=(".env",)),)
                 )
                 with mock.patch(
-                    "sprout_worktree_db.leases.repo_config",
+                    "sprout_worktree_db.drop.repo_config",
                     return_value=repo("myapp"),
                 ):
-                    lease = begin_drop(cfg, wt)
+                    remint = remint_key_for(cfg, wt)
+                self.assertEqual(remint, mint_key(wt, repo("myapp")))
+                lease = begin_drop(wt, remint_key=remint)
                 self.assertEqual(lease.key, mint_key(wt, repo("myapp")))
                 self.assertTrue(lease.touch_postgres)
                 self.assertEqual(lease.op, "drop")
@@ -81,11 +85,11 @@ class DropLeaseTest(unittest.TestCase):
                 )
                 state.save_state(st)
                 cfg = PluginConfig(repos=(repo("app"),))
-                by_wt = begin_drop(cfg, wt)
+                by_wt = begin_drop(wt)
                 self.assertEqual(by_wt.object_name, "")
                 self.assertFalse(by_wt.touch_postgres)
                 abort_drop(by_wt)
-                by_key = begin_drop(cfg, requested="app-prev")
+                by_key = begin_drop(requested="app-prev")
                 self.assertEqual(by_key.object_name, "")
                 self.assertFalse(by_key.touch_postgres)
                 finish_drop(by_key)
@@ -111,7 +115,7 @@ class DropLeaseTest(unittest.TestCase):
                 )
                 state.save_state(st)
                 cfg = PluginConfig(repos=(repo("app"),))
-                lease = begin_drop(cfg, wt, forget_only=True)
+                lease = begin_drop(wt, forget_only=True)
                 self.assertFalse(lease.touch_postgres)
                 finish_drop(lease)
                 self.assertNotIn(wt, state.load_state().worktrees)
@@ -137,7 +141,7 @@ class DropLeaseTest(unittest.TestCase):
                 )
                 state.save_state(st)
                 cfg = PluginConfig(repos=(repo("app"),))
-                lease = begin_drop(cfg, wt)
+                lease = begin_drop(wt)
                 self.assertEqual(lease.key, "app-feature-abc12")
                 mid = state.load_state()
                 self.assertEqual(
@@ -155,7 +159,7 @@ class DropLeaseTest(unittest.TestCase):
                 self.assertIn("in progress", str(ctx.exception))
                 # Second begin_drop must not mint another lease for the same slug.
                 with self.assertRaises(PluginError) as ctx2:
-                    begin_drop(cfg, wt)
+                    begin_drop(wt)
                 self.assertIn("in progress", str(ctx2.exception))
                 finish_drop(lease)
                 self.assertNotIn(wt, state.load_state().worktrees)
@@ -183,7 +187,7 @@ class DropLeaseTest(unittest.TestCase):
                 )
                 state.save_state(st)
                 cfg = PluginConfig(repos=(repo("app"),))
-                lease1 = begin_drop(cfg, wt)
+                lease1 = begin_drop(wt)
                 abort_drop(lease1)
                 after_abort = state.load_state()
                 self.assertEqual(
@@ -197,7 +201,7 @@ class DropLeaseTest(unittest.TestCase):
                 finish_drop(lease1)
                 self.assertIn(wt, state.load_state().worktrees)
                 # A fresh lease can proceed.
-                lease2 = begin_drop(cfg, wt)
+                lease2 = begin_drop(wt)
                 self.assertNotEqual(lease1.lease_id, lease2.lease_id)
                 finish_drop(lease2)
                 self.assertNotIn(wt, state.load_state().worktrees)
@@ -223,7 +227,7 @@ class DropLeaseTest(unittest.TestCase):
                 )
                 state.save_state(st)
                 cfg = PluginConfig(repos=(repo("app"),))
-                lease = begin_drop(cfg, wt)
+                lease = begin_drop(wt)
                 abort_drop(lease)
                 after = state.load_state()
                 self.assertEqual(
@@ -265,7 +269,7 @@ class DropLeaseTest(unittest.TestCase):
                 state.save_state(st)
                 cfg = PluginConfig(repos=(repo("app"),))
                 # TTL reclaim lets a new drop proceed.
-                lease = begin_drop(cfg, wt)
+                lease = begin_drop(wt)
                 self.assertEqual(lease.lease_id, 2)
                 self.assertIn("app-feature-abc12", state.load_state().leases)
                 finish_drop(lease)
@@ -305,8 +309,8 @@ class DropLeaseTest(unittest.TestCase):
                 state.save_state(st)
                 cfg = PluginConfig(repos=(repo("app"),))
                 with self.assertRaises(PluginError):
-                    begin_drop(cfg, wt)
-                lease = begin_drop(cfg, wt, force=True)
+                    begin_drop(wt)
+                lease = begin_drop(wt, force=True)
                 self.assertEqual(lease.lease_id, 2)
                 finish_drop(lease)
                 self.assertNotIn(wt, state.load_state().worktrees)
@@ -347,7 +351,7 @@ class DropLeaseTest(unittest.TestCase):
                 state.save_state(st)
                 cfg = PluginConfig(repos=(repo("app"),))
                 with self.assertRaises(PluginError) as ctx:
-                    begin_drop(cfg, wt, force=True)
+                    begin_drop(wt, force=True)
                 self.assertIn("provision in progress", str(ctx.exception))
                 self.assertIn(key, state.load_state().leases)
                 self.assertEqual(state.load_state().leases[key].op, "provision")
@@ -356,6 +360,8 @@ class DropLeaseTest(unittest.TestCase):
 
     def test_force_steals_on_remint_without_state_row(self):
         """--force remint steals the reminted slug (no force_keys preamble)."""
+        from sprout_worktree_db.drop import remint_key_for
+
         with tempfile.TemporaryDirectory() as tmp:
             os.environ["HERDR_PLUGIN_STATE_DIR"] = tmp
             try:
@@ -380,13 +386,14 @@ class DropLeaseTest(unittest.TestCase):
                 state.save_state(st)
                 cfg = PluginConfig(repos=(repo("myapp"),))
                 with mock.patch(
-                    "sprout_worktree_db.leases.repo_config",
+                    "sprout_worktree_db.drop.repo_config",
                     return_value=repo("myapp"),
                 ):
+                    remint = remint_key_for(cfg, wt)
                     with self.assertRaises(PluginError) as ctx:
-                        begin_drop(cfg, wt)
+                        begin_drop(wt, remint_key=remint)
                     self.assertIn("in progress", str(ctx.exception))
-                    lease = begin_drop(cfg, wt, force=True)
+                    lease = begin_drop(wt, force=True, remint_key=remint)
                 self.assertEqual(lease.key, key)
                 self.assertEqual(lease.lease_id, 2)
                 finish_drop(lease)
@@ -396,6 +403,7 @@ class DropLeaseTest(unittest.TestCase):
 
     def test_git_resolution_holds_no_lock(self):
         """Remint `git` runs before the flock, never inside it."""
+        import sprout_worktree_db.drop as drop_mod
         import sprout_worktree_db.leases as leases_mod
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -424,10 +432,12 @@ class DropLeaseTest(unittest.TestCase):
                         leases_mod, "locked_state", tracked_lock
                     ),
                     mock.patch.object(
-                        leases_mod, "repo_config", fake_repo_config
+                        drop_mod, "repo_config", fake_repo_config
                     ),
                 ):
-                    lease = begin_drop(cfg, wt)
+                    remint = drop_mod.remint_key_for(cfg, wt)
+                    self.assertEqual(calls, ["repo_config"])
+                    lease = begin_drop(wt, remint_key=remint)
                 self.assertEqual(
                     calls[0], "repo_config", f"git first, lock after: {calls}"
                 )
@@ -438,7 +448,7 @@ class DropLeaseTest(unittest.TestCase):
 
     def test_fast_path_skips_git_when_row_present(self):
         """Row present: remint is recovery-only, so no git runs at all."""
-        import sprout_worktree_db.leases as leases_mod
+        import sprout_worktree_db.drop as drop_mod
 
         with tempfile.TemporaryDirectory() as tmp:
             os.environ["HERDR_PLUGIN_STATE_DIR"] = tmp
@@ -459,36 +469,113 @@ class DropLeaseTest(unittest.TestCase):
                     )
                 )
                 cfg = PluginConfig(repos=(repo("app"),))
-                calls: list[str] = []
-                real_locked = leases_mod.locked_state
-
-                @contextmanager
-                def tracked_lock():
-                    calls.append("lock-enter")
-                    with real_locked() as st:
-                        yield st
-                    calls.append("lock-exit")
 
                 def fake_repo_config(cfg_arg, wt_arg):
-                    calls.append("repo_config")
-                    return repo("app")
+                    raise AssertionError("git must not run on the fast path")
 
-                with (
-                    mock.patch.object(
-                        leases_mod, "locked_state", tracked_lock
-                    ),
-                    mock.patch.object(
-                        leases_mod, "repo_config", fake_repo_config
-                    ),
+                with mock.patch.object(
+                    drop_mod, "repo_config", fake_repo_config
                 ):
-                    lease = begin_drop(cfg, wt)
+                    remint = drop_mod.remint_key_for(cfg, wt)
+                self.assertIsNone(remint)
+                lease = begin_drop(wt, remint_key=remint)
                 # Resolved key comes from the row, not the remint.
                 self.assertEqual(lease.key, "app-feature-abc12")
-                # Recovery-only remint: the fast path never shells git.
-                self.assertNotIn(
-                    "repo_config", calls, f"git must not run: {calls}"
-                )
                 abort_drop(lease)
+            finally:
+                del os.environ["HERDR_PLUGIN_STATE_DIR"]
+
+    def test_key_and_worktree_agree_resolves_key_only(self):
+        """Both flags agreeing: forget-set is the key's claim only."""
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["HERDR_PLUGIN_STATE_DIR"] = tmp
+            try:
+                wt = os.path.realpath(str(Path(tmp) / "feature"))
+                Path(wt).mkdir()
+                st = PluginState(
+                    worktrees={
+                        wt: WorktreeRecord(
+                            key="app-feature-abc12",
+                            repo="app",
+                            mode="dedicated",
+                            object="sprout_wt_app_feature_abc12",
+                            created_at="",
+                        )
+                    }
+                )
+                state.save_state(st)
+                lease = begin_drop(
+                    wt, requested="app-feature-abc12", forget_only=True
+                )
+                self.assertEqual(lease.key, "app-feature-abc12")
+                self.assertEqual(lease.worktrees, (wt,))
+                finish_drop(lease)
+                self.assertNotIn(wt, state.load_state().worktrees)
+            finally:
+                del os.environ["HERDR_PLUGIN_STATE_DIR"]
+
+    def test_key_with_foreign_worktree_refused(self):
+        """--key + unrelated --worktree: fail closed, keep both claims."""
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["HERDR_PLUGIN_STATE_DIR"] = tmp
+            try:
+                a = os.path.realpath(str(Path(tmp) / "a"))
+                b = os.path.realpath(str(Path(tmp) / "b"))
+                Path(a).mkdir()
+                Path(b).mkdir()
+                st = PluginState(
+                    worktrees={
+                        a: WorktreeRecord(
+                            key="key-a",
+                            repo="app",
+                            mode="dedicated",
+                            object="sprout_wt_key_a",
+                            created_at="",
+                        ),
+                        b: WorktreeRecord(
+                            key="key-b",
+                            repo="app",
+                            mode="dedicated",
+                            object="sprout_wt_key_b",
+                            created_at="",
+                        ),
+                    }
+                )
+                state.save_state(st)
+                with self.assertRaises(PluginError) as ctx:
+                    begin_drop(b, requested="key-a", forget_only=True)
+                self.assertIn("does not own", str(ctx.exception))
+                after = state.load_state()
+                self.assertIn(a, after.worktrees)
+                self.assertIn(b, after.worktrees)
+                self.assertNotIn("key-a", after.leases)
+            finally:
+                del os.environ["HERDR_PLUGIN_STATE_DIR"]
+
+    def test_orphan_key_with_tracked_worktree_refused(self):
+        """Orphan --key + tracked --worktree: fail closed, keep the claim."""
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["HERDR_PLUGIN_STATE_DIR"] = tmp
+            try:
+                b = os.path.realpath(str(Path(tmp) / "b"))
+                Path(b).mkdir()
+                st = PluginState(
+                    worktrees={
+                        b: WorktreeRecord(
+                            key="key-b",
+                            repo="app",
+                            mode="dedicated",
+                            object="sprout_wt_key_b",
+                            created_at="",
+                        )
+                    }
+                )
+                state.save_state(st)
+                with self.assertRaises(PluginError):
+                    begin_drop(b, requested="key-a")
+                after = state.load_state()
+                self.assertIn(b, after.worktrees)
+                self.assertNotIn("key-a", after.leases)
             finally:
                 del os.environ["HERDR_PLUGIN_STATE_DIR"]
 
@@ -527,7 +614,7 @@ class ExecuteDropLeaseAbortTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             cfg, wt, execute_drop_lease = self._setup(tmp)
             try:
-                lease = begin_drop(cfg, wt)
+                lease = begin_drop(wt)
                 with mock.patch(
                     "sprout_worktree_db.drop.drop_key",
                     side_effect=SproutError("boom"),
@@ -546,7 +633,7 @@ class ExecuteDropLeaseAbortTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             cfg, wt, execute_drop_lease = self._setup(tmp)
             try:
-                lease = begin_drop(cfg, wt)
+                lease = begin_drop(wt)
                 with mock.patch(
                     "sprout_worktree_db.drop.drop_key",
                     side_effect=SproutError("boom"),
