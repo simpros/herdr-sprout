@@ -21,7 +21,7 @@ from sprout_worktree_db.models import (
     SlugLease,
     WorktreeRecord,
 )
-from sprout_worktree_db.paths import LEGACY_CONFIG_DIR, state_path
+from sprout_worktree_db.paths import state_path
 
 # Crash mid-op leaves leases[K] forever without reclaim. Expired leases
 # are abort-equivalent under lock so automation can recover.
@@ -35,16 +35,13 @@ def _read_state_file() -> PluginState:
     :func:`models.normalize_state_dict`; the canonical form is persisted
     lazily by the next :func:`locked_state` mutation — never from this
     lock-free read path, so concurrent status/GC readers cannot tear
-    the write.
+    the write. Legacy *path* migration (``~/.config/sprout/...`` → herdr
+    state dir) happens once in :func:`paths.state_path`, shared with
+    config/secrets.
     """
-    primary = state_path()
-    path = primary
+    path = state_path()
     if not path.exists():
-        legacy = LEGACY_CONFIG_DIR / "worktree-db-state.json"
-        if legacy.exists():
-            path = legacy
-        else:
-            return PluginState()
+        return PluginState()
     try:
         text = path.read_text()
     except OSError as exc:
@@ -84,7 +81,11 @@ def locked_state() -> Iterator[PluginState]:
     """Exclusive lock around load → mutate → save of state.json.
 
     The exit save also persists any in-memory legacy normalization in
-    canonical form, so unlocked readers stay read-only.
+    canonical form, so unlocked readers stay read-only. The save runs
+    even when the critical section refuses (``SystemExit`` /
+    ``RuntimeError``): reclaim and other in-lock mutations are
+    abort-equivalent, and a refused op must not roll back prior reclaim
+    — the exclusive flock already serializes writers.
     """
     path = state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -92,8 +93,10 @@ def locked_state() -> Iterator[PluginState]:
     with open(lock_path, "a+", encoding="utf-8") as lock_fd:
         fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX)
         state = _read_state_file()
-        yield state
-        save_state(state)
+        try:
+            yield state
+        finally:
+            save_state(state)
 
 
 def claim_status(state: PluginState, rec: WorktreeRecord) -> str:

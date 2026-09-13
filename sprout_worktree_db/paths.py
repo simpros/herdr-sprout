@@ -82,7 +82,13 @@ def secrets_path() -> Path:
 
 
 def state_path() -> Path:
-    return state_dir() / "state.json"
+    primary = state_dir() / "state.json"
+    if primary.exists():
+        return primary
+    legacy = LEGACY_CONFIG_DIR / "worktree-db-state.json"
+    if legacy.exists():
+        return _migrate_legacy_file(primary, legacy, "state")
+    return primary
 
 
 def log_path() -> Path:

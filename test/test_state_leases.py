@@ -837,6 +837,64 @@ class SlugLeaseTest(unittest.TestCase):
             finally:
                 del os.environ["HERDR_PLUGIN_STATE_DIR"]
 
+    def test_locked_state_persists_reclaim_on_refusal(self):
+        """Reclaim survives a refused op: lock exit always saves."""
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["HERDR_PLUGIN_STATE_DIR"] = tmp
+            try:
+                key = "app-stale-abc12"
+                st = PluginState(
+                    worktrees={},
+                    leases={
+                        key: SlugLease(
+                            lease_id=1,
+                            key=key,
+                            op="drop",
+                            worktrees=(),
+                            object_name="sprout_wt_app_stale_abc12",
+                            reserved_at="2000-01-01T00:00:00+00:00",
+                        )
+                    },
+                    next_lease_id=2,
+                )
+                state.save_state(st)
+                with self.assertRaises(SystemExit):
+                    with state.locked_state() as locked:
+                        cleared = state.reclaim_expired_leases(locked)
+                        self.assertIn(key, cleared)
+                        raise SystemExit("busy: drop in progress")
+                self.assertNotIn(key, state.load_state().leases)
+            finally:
+                del os.environ["HERDR_PLUGIN_STATE_DIR"]
+
+    def test_legacy_state_path_migrates_once(self):
+        """state.json resolves through the shared legacy file migrator."""
+        import sprout_worktree_db.paths as paths
+
+        with tempfile.TemporaryDirectory() as tmp:
+            primary_dir = Path(tmp) / "primary"
+            legacy_dir = Path(tmp) / "legacy"
+            primary_dir.mkdir()
+            legacy_dir.mkdir()
+            legacy_file = legacy_dir / "worktree-db-state.json"
+            legacy_file.write_text(json.dumps({"worktrees": {}}))
+            with (
+                mock.patch.object(
+                    paths, "state_dir", return_value=primary_dir
+                ),
+                mock.patch.object(
+                    paths, "LEGACY_CONFIG_DIR", legacy_dir
+                ),
+            ):
+                resolved = paths.state_path()
+                self.assertEqual(resolved, primary_dir / "state.json")
+                self.assertTrue((primary_dir / "state.json").exists())
+                # Second resolve is a no-op (primary wins, legacy kept).
+                self.assertEqual(
+                    paths.state_path(), primary_dir / "state.json"
+                )
+                self.assertTrue(legacy_file.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
