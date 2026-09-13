@@ -20,6 +20,7 @@ from sprout_worktree_db.errors import (
     ConfigError,
     CorruptStateError,
     PluginError,
+    SproutError,
 )
 from sprout_worktree_db.models import PluginState, SlugLease
 
@@ -189,20 +190,57 @@ class StateSchemaTest(unittest.TestCase):
                     paths, "LEGACY_CONFIG_DIR", legacy_dir
                 ),
             ):
-                resolved = paths.state_path()
-                self.assertEqual(resolved, primary_dir / "state.json")
-                self.assertTrue((primary_dir / "state.json").exists())
-                # Second resolve is a no-op (primary wins, legacy kept).
+                # Getters stay pure — migration runs at the CLI boundary,
+                # and only when HERDR_PLUGIN_STATE_DIR is the default.
                 self.assertEqual(
                     paths.state_path(), primary_dir / "state.json"
                 )
+                self.assertFalse((primary_dir / "state.json").exists())
+                saved = os.environ.pop("HERDR_PLUGIN_STATE_DIR", None)
+                try:
+                    paths.migrate_legacy_files()
+                finally:
+                    if saved is not None:
+                        os.environ["HERDR_PLUGIN_STATE_DIR"] = saved
+                self.assertTrue((primary_dir / "state.json").exists())
+                # Second migrate is a no-op (primary wins, legacy kept).
+                saved = os.environ.pop("HERDR_PLUGIN_STATE_DIR", None)
+                try:
+                    paths.migrate_legacy_files()
+                finally:
+                    if saved is not None:
+                        os.environ["HERDR_PLUGIN_STATE_DIR"] = saved
                 self.assertTrue(legacy_file.exists())
+
+    def test_override_dir_is_sole_source(self):
+        """Explicit HERDR_PLUGIN_*_DIR never imports the home legacy tree."""
+        import sprout_worktree_db.paths as paths
+
+        with tempfile.TemporaryDirectory() as tmp:
+            legacy_dir = Path(tmp) / "legacy"
+            legacy_dir.mkdir()
+            (legacy_dir / "worktree-db-state.json").write_text(
+                json.dumps({"worktrees": {}})
+            )
+            override = Path(tmp) / "override"
+            override.mkdir()
+            with (
+                mock.patch.object(
+                    paths, "LEGACY_CONFIG_DIR", legacy_dir
+                ),
+                mock.patch.dict(
+                    os.environ, {"HERDR_PLUGIN_STATE_DIR": str(override)}
+                ),
+            ):
+                self.assertEqual(paths.state_path(), override / "state.json")
+                paths.migrate_legacy_files()
+                self.assertFalse((override / "state.json").exists())
 
 
 class ErrorHierarchyTest(unittest.TestCase):
     def test_domain_errors_stay_system_exit_compatible(self):
         """PluginError subclasses SystemExit: old catches keep working."""
-        for cls in (BusyError, ConfigError, CorruptStateError):
+        for cls in (BusyError, ConfigError, CorruptStateError, SproutError):
             self.assertTrue(issubclass(cls, PluginError))
             with self.assertRaises(SystemExit):
                 raise cls("boom")

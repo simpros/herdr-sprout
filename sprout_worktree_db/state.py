@@ -35,8 +35,8 @@ def _read_state_file() -> PluginState:
     The schema is canonical-only (see :meth:`models.PluginState.from_dict`):
     pre-0.1.0 shapes fail closed here, and this lock-free path never writes,
     so concurrent status/GC readers cannot tear the file. Legacy *path*
-    migration (``~/.config/sprout/...`` → herdr state dir) happens once in
-    :func:`paths.state_path`, shared with config/secrets.
+    migration (``~/.config/sprout/...`` → herdr dirs) happens once via
+    :func:`paths.migrate_legacy_files` at the CLI boundary, never here.
     """
     path = state_path()
     if not path.exists():
@@ -80,7 +80,7 @@ def locked_state() -> Iterator[PluginState]:
     """Exclusive lock around load → mutate → save of state.json.
 
     The exit save runs even when the critical section refuses
-    (``PluginError`` / ``RuntimeError``): reclaim and other in-lock
+    (``PluginError``): reclaim and other in-lock
     mutations are abort-equivalent, and a refused op must not roll back
     prior reclaim — the exclusive flock already serializes writers.
     """

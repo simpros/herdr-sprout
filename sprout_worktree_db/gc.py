@@ -40,13 +40,11 @@ def holds_postgres_object(
     - drop lease: the slug is held only; ``touch_postgres`` objects are
       counted from the lease loop in :func:`live_objects_from_state`, so
       the claim contributes nothing here.
-    - provision lease before finalize (empty object): slug only, nothing live.
-    - provision lease after finalize: the object is real — live.
+    - provision lease: the claim row exists only after finalize, so its
+      object is real — live.
     - no lease: live when the claim is Postgres-backed.
     """
     if lease is not None and lease.op != "provision":
-        return None
-    if lease is not None and not rec.object:
         return None
     obj, touch = postgres_target(rec, rec.key)
     return obj if touch and obj else None

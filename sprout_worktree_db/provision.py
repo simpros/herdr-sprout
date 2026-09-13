@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from sprout_worktree_db.envfile import merge_env_file
 from sprout_worktree_db.errors import ConfigError
 from sprout_worktree_db.gitutil import repo_config
-from sprout_worktree_db.leases import ProvisionLease, claim_provision
+from sprout_worktree_db.leases import claim_provision
 from sprout_worktree_db.models import (
     EnvInjection,
     PluginConfig,
@@ -21,7 +21,6 @@ from sprout_worktree_db.paths import config_path, log
 from sprout_worktree_db.steps import run_steps
 from sprout_worktree_db.sprout import (
     attach_preview,
-    drop_key,
     provision_dedicated,
 )
 
@@ -29,37 +28,6 @@ from sprout_worktree_db.sprout import (
 def _apply_pending_env(injection: EnvInjection) -> None:
     for env_file in injection.env_files:
         merge_env_file(env_file, injection.pending_env)
-
-
-def _drop_orphan_on_finalize_failure(
-    cfg: PluginConfig,
-    secrets: Secrets,
-    req: ProvisionRequest,
-    lease: ProvisionLease,
-    injection: EnvInjection | None,
-    finalized: bool,
-) -> None:
-    """Best-effort cleanup of the designed orphan gap.
-
-    Crash (or a lost lease) between a successful dedicated ``sprout``
-    provision and ``finalize`` leaves a real Postgres DB behind an
-    ``object=""`` claim row that GC will not plan (the claim path still
-    exists). When this run created the object — dedicated mode, sprout
-    reported success, finalize never ran, and no object predates this
-    claim — drop it best-effort. Skipped otherwise: preview objects are
-    shared, post-finalize claims are GC territory, and re-provisions must
-    never tear down a live DB that predates the run. Never raises.
-    """
-    if finalized or injection is None:
-        return
-    if req.mode != "dedicated" or lease.prior_object:
-        return
-    try:
-        drop_key(cfg, secrets, lease.key)
-    except Exception as exc:
-        log(f"provision orphan cleanup failed for {lease.key}: {exc}")
-    else:
-        log(f"provision orphan cleanup: dropped {injection.object_name}")
 
 
 def do_provision(
@@ -82,48 +50,42 @@ def do_provision(
             f"provision [{req.mode}] worktree={worktree} "
             f"key={lease.key} repo={repo.name}"
         )
-        injection: EnvInjection | None = None
-        finalized = False
-        try:
-            if req.mode == "preview":
-                injection = attach_preview(cfg, secrets, repo, worktree)
-            else:
-                injection = provision_dedicated(
-                    cfg, secrets, repo, worktree, lease.key
-                )
+        # Lease-only claim wrote no row: a crash before finalize leaves no
+        # placeholder behind, so a leftover `sprout_wt_*` is a normal
+        # pathless postgres orphan that GC plans after TTL reclaim.
+        if req.mode == "preview":
+            injection = attach_preview(cfg, secrets, repo, worktree)
+        else:
+            injection = provision_dedicated(
+                cfg, secrets, repo, worktree, lease.key
+            )
 
-            record = WorktreeRecord(
-                key=lease.key,
-                repo=repo.name,
-                mode=req.mode,
-                object=injection.object_name,
-                created_at=datetime.now(timezone.utc).isoformat(
-                    timespec="seconds"
-                ),
-                env_files=[str(p) for p in injection.env_files],
-                steps=[],
-                pr_id=injection.pr_id,
-                preview_url=injection.preview_url,
-            )
-            # Finalize gates disk truth: env + steps only after the claim sticks.
-            # The provision lease is held through env/steps so drop/GC cannot race.
-            lease.finalize(record)
-            finalized = True
+        record = WorktreeRecord(
+            key=lease.key,
+            repo=repo.name,
+            mode=req.mode,
+            object=injection.object_name,
+            created_at=datetime.now(timezone.utc).isoformat(
+                timespec="seconds"
+            ),
+            env_files=[str(p) for p in injection.env_files],
+            steps=[],
+            pr_id=injection.pr_id,
+            preview_url=injection.preview_url,
+        )
+        # Finalize gates disk truth: env + steps only after the claim sticks.
+        # The provision lease is held through env/steps so drop/GC cannot race.
+        lease.finalize(record)
 
-            _apply_pending_env(injection)
-            steps = (
-                run_steps(cfg, secrets, repo, worktree)
-                if (req.with_steps and repo.steps)
-                else []
-            )
-            if steps:
-                record.steps = steps
-                lease.record_steps(steps)
-        except BaseException:
-            _drop_orphan_on_finalize_failure(
-                cfg, secrets, req, lease, injection, finalized
-            )
-            raise
+        _apply_pending_env(injection)
+        steps = (
+            run_steps(cfg, secrets, repo, worktree)
+            if (req.with_steps and repo.steps)
+            else []
+        )
+        if steps:
+            record.steps = steps
+            lease.record_steps(steps)
 
     payload = record.to_dict()
     log(

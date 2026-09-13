@@ -388,7 +388,7 @@ class PackageLayoutTest(unittest.TestCase):
                 "sprout_worktree_db.sprout.sprout_cli",
                 return_value=(0, json.dumps(previews), ""),
             ):
-                with self.assertRaises(RuntimeError) as ctx:
+                with self.assertRaises(SystemExit) as ctx:
                     attach_preview(
                         cfg,
                         {"SPROUT_PREVIEW_OWNER_URL": "postgres://u:p@h/db"},

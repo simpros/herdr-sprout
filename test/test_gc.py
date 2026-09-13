@@ -165,20 +165,19 @@ class PlanOrphansTest(unittest.TestCase):
                 gc_mod.live_objects_from_state(finalized, live),
                 {"sprout_wt_app_feat"},
             )
-            # Pre-finalize row (empty object) holds the slug only.
-            pending = PluginState(
-                worktrees={
-                    str(wt): WorktreeRecord(
-                        key="app-feat",
-                        repo="app",
-                        mode="dedicated",
-                        object="",
-                        created_at="",
-                    )
-                },
-                leases=dict(finalized.leases),
+            # In-flight provision (lease only, no row yet) holds the slug
+            # only — nothing live to count, and no placeholder row exists.
+            inflight = PluginState(leases=dict(finalized.leases))
+            self.assertEqual(gc_mod.live_objects_from_state(inflight, live), set())
+            # ... while its leftover DB (if sprout already created it) is a
+            # normal pathless postgres orphan for plan_orphans.
+            plans = gc_mod.plan_orphans(inflight, live, ["sprout_wt_app_feat"])
+            self.assertEqual(plans, [])  # lease still held → skipped
+            expired = PluginState(leases={})
+            plans2 = gc_mod.plan_orphans(expired, set(), ["sprout_wt_app_feat"])
+            self.assertEqual(
+                [p.object_name for p in plans2], ["sprout_wt_app_feat"]
             )
-            self.assertEqual(gc_mod.live_objects_from_state(pending, live), set())
 
     def test_plan_skips_leased_rows(self):
         with tempfile.TemporaryDirectory() as tmp:

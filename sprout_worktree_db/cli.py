@@ -12,7 +12,12 @@ from sprout_worktree_db.event import event_worktree_path
 from sprout_worktree_db.gc import gc
 from sprout_worktree_db.gitutil import repo_config
 from sprout_worktree_db.models import DropRequest, PluginConfig, ProvisionRequest, Secrets
-from sprout_worktree_db.paths import load_config, load_secrets, log
+from sprout_worktree_db.paths import (
+    load_config,
+    load_secrets,
+    log,
+    migrate_legacy_files,
+)
 from sprout_worktree_db.drop import do_drop
 from sprout_worktree_db.provision import do_provision
 from sprout_worktree_db.state import claim_status, load_state
@@ -63,6 +68,7 @@ def status() -> int:
 
 
 def hook(event: str) -> int:
+    migrate_legacy_files()
     try:
         cfg = load_config()
     except PluginError as exc:
@@ -191,6 +197,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.mode == "hook":
         return hook(args.event)
 
+    migrate_legacy_files()
     try:
         return _dispatch(cfg := load_config(), load_secrets(), args)
     except PluginError as exc:

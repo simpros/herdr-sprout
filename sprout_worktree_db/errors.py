@@ -31,3 +31,13 @@ class ConfigError(PluginError):
 
 class CorruptStateError(PluginError):
     """``state.json`` shape violations — fail closed, never wipe claims."""
+
+
+class SproutError(PluginError):
+    """Expected operational failure (sprout CLI, attach, drop, lost lease).
+
+    Every foreseeable provision/drop failure raises this instead of a bare
+    ``RuntimeError`` so CLI ``main`` maps it to a one-line ``exit 1``
+    (and hooks log cleanly). Keep ``RuntimeError`` for genuine
+    programming bugs only.
+    """

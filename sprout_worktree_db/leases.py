@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Iterator
 
-from sprout_worktree_db.errors import BusyError, ConfigError
+from sprout_worktree_db.errors import BusyError, ConfigError, SproutError
 from sprout_worktree_db.gitutil import repo_config
 from sprout_worktree_db.keys import (
     mint_key,
@@ -112,22 +112,25 @@ def _claim_key(
     *,
     mode: Mode,
     requested: str | None = None,
-) -> tuple[str, int, str]:
+) -> tuple[str, int]:
     """Atomically resolve + persist a provision lease before slow sprout work.
 
-    Returns ``(key, lease_id, prior_object)``. Re-provision reuses the stored
-    key so passwords/objects stay stable. One key maps to at most one
-    worktree path. ``prior_object`` is the pre-claim object (``""`` for a
-    fresh claim) so provision can best-effort clean an orphaned dedicated
-    DB only when this run created it — never a live DB that predates us.
+    Lease-only claim: no ``worktrees`` row is written here. The lease's
+    ``worktrees=(worktree,)`` is the in-flight reservation; :func:`_finalize_claim`
+    inserts the real row. After TTL reclaim a leftover ``sprout_wt_*`` is a
+    normal pathless postgres orphan — GC already plans those, so there is no
+    ``object=""`` phase sentinel and no in-process orphan cleanup.
 
-    Claim reserves the key under an exclusive provision lease. On re-claim the
-    existing row is left untouched until finalization writes mode/object.
-    In-place mode changes are refused — drop first so dedicated ``sprout_wt_*``
-    teardown stays on the drop/GC path (no dual-object-under-one-key).
+    Returns ``(key, lease_id)``. Re-provision reuses the finalized row's key
+    so passwords/objects stay stable. One key maps to at most one worktree
+    path. In-place mode changes are refused — drop first so dedicated
+    ``sprout_wt_*`` teardown stays on the drop/GC path.
     """
     with locked_state() as state:
         reclaim_expired_leases(state)
+        for res in state.leases.values():
+            if worktree in res.worktrees:
+                raise BusyError(_busy_msg(res.key, res))
         previous = state.worktrees.get(worktree)
         if previous and previous.key in state.leases:
             raise BusyError(_busy_msg(previous.key, state.leases[previous.key]))
@@ -152,21 +155,12 @@ def _claim_key(
                 f"key {key!r} already claimed by {holder}; "
                 "drop that worktree first"
             )
-        prior_object = previous.object if previous is not None else ""
-        if previous is None:
-            state.worktrees[worktree] = WorktreeRecord(
-                key=key,
-                repo=repo.name,
-                mode=mode,
-                object="",
-                created_at=_now_iso(),
-            )
         lease = _mint_provision_lease(
             state,
             key,
             worktrees=(worktree,),
         )
-        return key, lease.lease_id, prior_object
+        return key, lease.lease_id
 
 
 def _provision_lease_valid(
@@ -186,39 +180,54 @@ def _finalize_claim(
 ) -> None:
     """Compare-and-swap provision result; keep the provision lease.
 
+    Lease-only claim wrote no row, so this inserts the real claim row.
     The lease stays until release so concurrent drop/GC cannot tear
     down the object between finalize and deferred env merge / steps.
     Raises on a lost lease: env must never merge against a stale claim.
     """
     with locked_state() as state:
         reclaim_expired_leases(state)
-        claimed = state.worktrees.get(worktree)
-        if claimed is None:
-            raise RuntimeError(
-                f"key claim lost for {worktree}: row removed during provision "
-                f"(provisioned {key!r})"
-            )
         if not _provision_lease_valid(state, key, lease_id):
-            raise RuntimeError(
+            raise SproutError(
                 f"key claim lost for {worktree}: provision lease gone "
                 f"(provisioned {key!r})"
             )
-        if claimed.key != key:
-            raise RuntimeError(
-                f"key claim lost for {worktree}: held {claimed.key!r}, "
+        if record.key != key:
+            raise SproutError(
+                f"key claim lost for {worktree}: held {key!r}, "
+                f"provisioned {record.key!r}"
+            )
+        existing = state.worktrees.get(worktree)
+        if existing is not None and existing.key != key:
+            raise SproutError(
+                f"key claim lost for {worktree}: held {existing.key!r}, "
                 f"provisioned {key!r}"
             )
-        if claimed.created_at:
-            record.created_at = claimed.created_at
+        holder = next(
+            (
+                p
+                for p, r in state.worktrees.items()
+                if r.key == key and p != worktree
+            ),
+            None,
+        )
+        if holder:
+            raise SproutError(
+                f"key {key!r} already claimed by {holder}; "
+                "drop that worktree first"
+            )
+        if existing is not None and existing.created_at:
+            record.created_at = existing.created_at
         state.worktrees[worktree] = record
 
 
 def _pop_provision_lease(key: str, lease_id: int) -> None:
     """Lease-id-fenced pop of a provision lease (no-op when fenced out).
 
-    Single canonical pop: failure and success both clear only the lease and
-    keep the claim row — the row is CAS-written by finalization, never by
-    the lease pop.
+    Single canonical pop: failure and success both clear only the lease.
+    The claim row is written by finalization only — a run that never
+    finalized leaves no row, so a leftover ``sprout_wt_*`` is a normal
+    pathless postgres orphan for GC (never a placeholder row).
     """
     with locked_state() as state:
         if not _provision_lease_valid(state, key, lease_id):
@@ -235,15 +244,14 @@ class ProvisionLease:
             lease.finalize(record)
             lease.record_steps(steps)
 
-    ``__exit__`` always clears the provision lease; the claim row is kept
-    either way. ``prior_object`` is the object that predated this claim
-    (``""`` when fresh) — provision uses it to scope orphan cleanup.
+    ``__exit__`` always clears the provision lease. The claim row is
+    inserted by ``finalize`` only — a run that never finalized leaves no
+    row behind.
     """
 
     worktree: str
     key: str
     lease_id: int
-    prior_object: str = ""
 
     def finalize(self, record: WorktreeRecord) -> None:
         _finalize_claim(self.worktree, self.key, self.lease_id, record)
@@ -264,7 +272,7 @@ def claim_provision(
     requested: str | None = None,
 ) -> Iterator[ProvisionLease]:
     """Claim a provision lease and yield a session handle (always released)."""
-    key, lease_id, prior_object = _claim_key(
+    key, lease_id = _claim_key(
         worktree, repo, mode=mode, requested=requested
     )
     try:
@@ -272,7 +280,6 @@ def claim_provision(
             worktree=worktree,
             key=key,
             lease_id=lease_id,
-            prior_object=prior_object,
         )
     finally:
         _pop_provision_lease(key, lease_id)
@@ -363,6 +370,9 @@ def _drop_target(
         if record:
             obj, touch = postgres_target(record, record.key)
             return _bake(record.key, obj, touch, (wt,))
+        for res in state.leases.values():
+            if wt in res.worktrees:
+                raise BusyError(_busy_msg(res.key, res))
         if remint_key is not None:
             obj, touch = postgres_target(None, remint_key)
             return _bake(remint_key, obj, touch, (wt,))

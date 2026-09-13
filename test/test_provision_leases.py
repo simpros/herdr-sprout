@@ -41,11 +41,11 @@ class ProvisionLeaseTest(unittest.TestCase):
                 with claim_provision(wt, repo("app"), mode="dedicated") as lease:
                     key = lease.key
                     mid = state.load_state()
-                    self.assertEqual(
-                        state.claim_status(mid, mid.worktrees[wt]),
-                        "provisioning",
-                    )
+                    # Lease-only claim: no row until finalize; the lease
+                    # itself is the in-flight reservation.
+                    self.assertNotIn(wt, mid.worktrees)
                     self.assertEqual(mid.leases[key].op, "provision")
+                    self.assertEqual(mid.leases[key].worktrees, (wt,))
                     cfg = PluginConfig(repos=(repo("app"),))
                     with self.assertRaises(SystemExit) as ctx:
                         begin_drop(cfg, wt)
@@ -56,7 +56,7 @@ class ProvisionLeaseTest(unittest.TestCase):
                 del os.environ["HERDR_PLUGIN_STATE_DIR"]
 
     def test_session_releases_on_error(self):
-        """Exception inside the session still clears the lease, keeps row."""
+        """Exception inside the session still clears the lease, writes no row."""
         with tempfile.TemporaryDirectory() as tmp:
             os.environ["HERDR_PLUGIN_STATE_DIR"] = tmp
             try:
@@ -70,7 +70,9 @@ class ProvisionLeaseTest(unittest.TestCase):
                         raise RuntimeError("sprout boom")
                 after = state.load_state()
                 self.assertNotIn(key, after.leases)
-                self.assertIn(wt, after.worktrees)
+                # Lease-only claim: no finalize ran, so no row exists.
+                # A leftover sprout_wt_* is a pathless postgres orphan for GC.
+                self.assertNotIn(wt, after.worktrees)
             finally:
                 del os.environ["HERDR_PLUGIN_STATE_DIR"]
 
@@ -107,7 +109,7 @@ class ProvisionLeaseTest(unittest.TestCase):
                 stale = ProvisionLease(
                     worktree=wt, key="app-feature-abc12", lease_id=99
                 )
-                with self.assertRaises(RuntimeError) as ctx:
+                with self.assertRaises(SystemExit) as ctx:
                     stale.finalize(
                         WorktreeRecord(
                             key="app-feature-abc12",
@@ -293,8 +295,8 @@ class ProvisionLeaseTest(unittest.TestCase):
             finally:
                 del os.environ["HERDR_PLUGIN_STATE_DIR"]
 
-    def test_prior_object_scopes_orphan_cleanup(self):
-        """Fresh claims carry prior_object=""; re-provisions carry the old one."""
+    def test_reprovision_reuses_finalized_key(self):
+        """Fresh claims mint; re-provisions reuse the finalized row's key."""
         with tempfile.TemporaryDirectory() as tmp:
             os.environ["HERDR_PLUGIN_STATE_DIR"] = tmp
             try:
@@ -303,8 +305,9 @@ class ProvisionLeaseTest(unittest.TestCase):
                 with claim_provision(
                     wt, repo("app"), mode="dedicated"
                 ) as lease:
-                    self.assertEqual(lease.prior_object, "")
                     key = lease.key
+                    # Lease-only claim: no row until finalize.
+                    self.assertNotIn(wt, state.load_state().worktrees)
                     lease.finalize(
                         WorktreeRecord(
                             key=key,
@@ -314,17 +317,27 @@ class ProvisionLeaseTest(unittest.TestCase):
                             created_at="",
                         )
                     )
+                self.assertIn(wt, state.load_state().worktrees)
                 with claim_provision(
                     wt, repo("app"), mode="dedicated"
                 ) as lease2:
                     self.assertEqual(lease2.key, key)
-                    self.assertEqual(lease2.prior_object, object_name(key))
+                    # Finalized row stays until the second finalize.
+                    self.assertEqual(
+                        state.load_state().worktrees[wt].object,
+                        object_name(key),
+                    )
             finally:
                 del os.environ["HERDR_PLUGIN_STATE_DIR"]
 
 
 class ProvisionOrphanCleanupTest(unittest.TestCase):
-    """Sprout success + crash-before-finalize must not leave a hidden DB."""
+    """Lease-only claim: crash-before-finalize leaves no row for GC to miss.
+
+    There is no in-process orphan drop — a leftover ``sprout_wt_*`` after
+    TTL reclaim is a normal pathless postgres orphan that
+    :func:`gc.plan_orphans` already plans.
+    """
 
     def _setup(self, tmp: str):
         wt = str(Path(tmp) / "wt")
@@ -338,7 +351,10 @@ class ProvisionOrphanCleanupTest(unittest.TestCase):
     def _teardown(self):
         del os.environ["HERDR_PLUGIN_STATE_DIR"]
 
-    def test_dedicated_finalize_failure_drops_orphan(self):
+    def test_finalize_failure_writes_no_row(self):
+        """Lost lease at finalize: no row, no hidden placeholder."""
+        from sprout_worktree_db.errors import SproutError
+
         with tempfile.TemporaryDirectory() as tmp:
             cfg, wt = self._setup(tmp)
             try:
@@ -353,14 +369,11 @@ class ProvisionOrphanCleanupTest(unittest.TestCase):
                         return_value=inj,
                     ),
                     mock.patch(
-                        "sprout_worktree_db.provision.drop_key"
-                    ) as drop_key,
-                    mock.patch(
                         "sprout_worktree_db.leases._finalize_claim",
-                        side_effect=RuntimeError("lease lost"),
+                        side_effect=SproutError("lease lost"),
                     ),
                 ):
-                    with self.assertRaises(RuntimeError):
+                    with self.assertRaises(SystemExit):
                         do_provision(
                             cfg,
                             {},
@@ -370,36 +383,23 @@ class ProvisionOrphanCleanupTest(unittest.TestCase):
                                 with_steps=False,
                             ),
                         )
-                drop_key.assert_called_once()
-                key = state.load_state().worktrees[wt].key
-                self.assertEqual(drop_key.call_args[0][2], key)
+                # No placeholder row — GC sees a pathless postgres orphan.
+                self.assertNotIn(wt, state.load_state().worktrees)
             finally:
                 self._teardown()
 
-    def test_cleanup_failure_never_masks_original_error(self):
+    def test_sprout_failure_writes_no_row(self):
+        """Sprout itself failed: nothing to clean, nothing persisted."""
+        from sprout_worktree_db.errors import SproutError
+
         with tempfile.TemporaryDirectory() as tmp:
             cfg, wt = self._setup(tmp)
             try:
-                inj = EnvInjection(
-                    object_name="sprout_wt_new",
-                    env_files=(),
-                    pending_env={},
-                )
-                with (
-                    mock.patch(
-                        "sprout_worktree_db.provision.provision_dedicated",
-                        return_value=inj,
-                    ),
-                    mock.patch(
-                        "sprout_worktree_db.provision.drop_key",
-                        side_effect=RuntimeError("drop boom"),
-                    ),
-                    mock.patch(
-                        "sprout_worktree_db.leases._finalize_claim",
-                        side_effect=RuntimeError("lease lost"),
-                    ),
+                with mock.patch(
+                    "sprout_worktree_db.provision.provision_dedicated",
+                    side_effect=SproutError("sprout boom"),
                 ):
-                    with self.assertRaises(RuntimeError) as ctx:
+                    with self.assertRaises(SystemExit):
                         do_provision(
                             cfg,
                             {},
@@ -409,128 +409,11 @@ class ProvisionOrphanCleanupTest(unittest.TestCase):
                                 with_steps=False,
                             ),
                         )
-                self.assertIn("lease lost", str(ctx.exception))
+                self.assertNotIn(wt, state.load_state().worktrees)
             finally:
                 self._teardown()
 
-    def test_preview_never_drops_shared_object(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            cfg, wt = self._setup(tmp)
-            try:
-                inj = EnvInjection(
-                    object_name="sprout_shared_pr1",
-                    env_files=(),
-                    pending_env={},
-                )
-                with (
-                    mock.patch(
-                        "sprout_worktree_db.provision.attach_preview",
-                        return_value=inj,
-                    ),
-                    mock.patch(
-                        "sprout_worktree_db.provision.drop_key"
-                    ) as drop_key,
-                    mock.patch(
-                        "sprout_worktree_db.leases._finalize_claim",
-                        side_effect=RuntimeError("lease lost"),
-                    ),
-                ):
-                    with self.assertRaises(RuntimeError):
-                        do_provision(
-                            cfg,
-                            {},
-                            ProvisionRequest(
-                                worktree=wt,
-                                mode="preview",
-                                with_steps=False,
-                            ),
-                        )
-                drop_key.assert_not_called()
-            finally:
-                self._teardown()
-
-    def test_reprovision_never_drops_predating_object(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            cfg, wt = self._setup(tmp)
-            try:
-                state.save_state(
-                    PluginState(
-                        worktrees={
-                            wt: WorktreeRecord(
-                                key="myapp-wt-abc12",
-                                repo="myapp",
-                                mode="dedicated",
-                                object="sprout_wt_live",
-                                created_at="2020-01-01T00:00:00+00:00",
-                            )
-                        }
-                    )
-                )
-                inj = EnvInjection(
-                    object_name="sprout_wt_live",
-                    env_files=(),
-                    pending_env={},
-                )
-                with (
-                    mock.patch(
-                        "sprout_worktree_db.provision.provision_dedicated",
-                        return_value=inj,
-                    ),
-                    mock.patch(
-                        "sprout_worktree_db.provision.drop_key"
-                    ) as drop_key,
-                    mock.patch(
-                        "sprout_worktree_db.leases._finalize_claim",
-                        side_effect=RuntimeError("lease lost"),
-                    ),
-                ):
-                    with self.assertRaises(RuntimeError):
-                        do_provision(
-                            cfg,
-                            {},
-                            ProvisionRequest(
-                                worktree=wt,
-                                mode="dedicated",
-                                with_steps=False,
-                            ),
-                        )
-                drop_key.assert_not_called()
-                # Predating claim is untouched.
-                self.assertEqual(
-                    state.load_state().worktrees[wt].object, "sprout_wt_live"
-                )
-            finally:
-                self._teardown()
-
-    def test_sprout_failure_leaves_no_cleanup_target(self):
-        """Sprout itself failed (no injection): nothing known to clean."""
-        with tempfile.TemporaryDirectory() as tmp:
-            cfg, wt = self._setup(tmp)
-            try:
-                with (
-                    mock.patch(
-                        "sprout_worktree_db.provision.provision_dedicated",
-                        side_effect=RuntimeError("sprout boom"),
-                    ),
-                    mock.patch(
-                        "sprout_worktree_db.provision.drop_key"
-                    ) as drop_key,
-                ):
-                    with self.assertRaises(RuntimeError):
-                        do_provision(
-                            cfg,
-                            {},
-                            ProvisionRequest(
-                                worktree=wt,
-                                mode="dedicated",
-                                with_steps=False,
-                            ),
-                        )
-                drop_key.assert_not_called()
-            finally:
-                self._teardown()
-
-    def test_post_finalize_failure_is_gc_territory(self):
+    def test_post_finalize_failure_keeps_claim(self):
         """Env merge after finalize: claim has the object, GC owns orphans."""
         with tempfile.TemporaryDirectory() as tmp:
             cfg, wt = self._setup(tmp)
@@ -546,9 +429,6 @@ class ProvisionOrphanCleanupTest(unittest.TestCase):
                         return_value=inj,
                     ),
                     mock.patch(
-                        "sprout_worktree_db.provision.drop_key"
-                    ) as drop_key,
-                    mock.patch(
                         "sprout_worktree_db.provision._apply_pending_env",
                         side_effect=RuntimeError("env boom"),
                     ),
@@ -563,12 +443,21 @@ class ProvisionOrphanCleanupTest(unittest.TestCase):
                                 with_steps=False,
                             ),
                         )
-                drop_key.assert_not_called()
                 self.assertEqual(
                     state.load_state().worktrees[wt].object, "sprout_wt_new"
                 )
             finally:
                 self._teardown()
+
+    def test_crash_before_finalize_is_gc_plannable(self):
+        """No row + leftover DB ⇒ GC plans a pathless postgres orphan."""
+        from sprout_worktree_db import gc as gc_mod
+
+        st = PluginState(worktrees={})
+        plans = gc_mod.plan_orphans(st, set(), ["sprout_wt_new"])
+        self.assertEqual(
+            [p.object_name for p in plans], ["sprout_wt_new"]
+        )
 
 
 if __name__ == "__main__":

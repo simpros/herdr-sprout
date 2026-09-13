@@ -63,33 +63,42 @@ def _migrate_legacy_file(primary: Path, legacy: Path, kind: str) -> Path:
 
 
 def config_path() -> Path:
-    primary = config_dir() / "config.json"
-    if primary.exists():
-        return primary
-    legacy = LEGACY_CONFIG_DIR / "worktree-db.json"
-    if legacy.exists():
-        return _migrate_legacy_file(primary, legacy, "config")
-    return primary
+    """Pure resolution: the herdr config file, no I/O or migration."""
+    return config_dir() / "config.json"
 
 
 def secrets_path() -> Path:
-    primary = config_dir() / "secrets.env"
-    if primary.exists():
-        return primary
-    legacy = LEGACY_CONFIG_DIR / "worktree-db.env"
-    if legacy.exists():
-        return _migrate_legacy_file(primary, legacy, "secrets")
-    return primary
+    """Pure resolution: the herdr secrets file, no I/O or migration."""
+    return config_dir() / "secrets.env"
 
 
 def state_path() -> Path:
-    primary = state_dir() / "state.json"
-    if primary.exists():
-        return primary
-    legacy = LEGACY_CONFIG_DIR / "worktree-db-state.json"
-    if legacy.exists():
-        return _migrate_legacy_file(primary, legacy, "state")
-    return primary
+    """Pure resolution: the herdr state file, no I/O or migration."""
+    return state_dir() / "state.json"
+
+
+def migrate_legacy_files() -> None:
+    """One-shot copy of ``~/.config/sprout/...`` into the herdr dirs.
+
+    Deliberate CLI/bootstrap boundary (called once from ``cli.main`` /
+    ``cli.hook``) — never from path resolution, so getters stay pure and
+    unit tests with ``HERDR_PLUGIN_*_DIR`` overrides never inherit the
+    operator's home tree. Migration runs only when the herdr dirs are the
+    defaults (env unset): an explicit override directory is the sole
+    source — empty means empty.
+    """
+    if os.environ.get("HERDR_PLUGIN_CONFIG_DIR") is None:
+        for primary, legacy, kind in (
+            (config_path(), LEGACY_CONFIG_DIR / "worktree-db.json", "config"),
+            (secrets_path(), LEGACY_CONFIG_DIR / "worktree-db.env", "secrets"),
+        ):
+            if not primary.exists() and legacy.exists():
+                _migrate_legacy_file(primary, legacy, kind)
+    if os.environ.get("HERDR_PLUGIN_STATE_DIR") is None:
+        primary = state_path()
+        legacy = LEGACY_CONFIG_DIR / "worktree-db-state.json"
+        if not primary.exists() and legacy.exists():
+            _migrate_legacy_file(primary, legacy, "state")
 
 
 def log_path() -> Path:

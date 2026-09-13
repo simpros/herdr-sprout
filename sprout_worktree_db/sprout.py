@@ -10,7 +10,7 @@ import urllib.parse
 from pathlib import Path
 
 from sprout_worktree_db.envfile import read_env_values
-from sprout_worktree_db.errors import ConfigError
+from sprout_worktree_db.errors import ConfigError, SproutError
 from sprout_worktree_db.gitutil import branch_of, run
 from sprout_worktree_db.models import (
     EnvInjection,
@@ -100,7 +100,7 @@ def provision_dedicated(
             ],
         )
         if rc != 0:
-            raise RuntimeError(
+            raise SproutError(
                 f"sprout worktree-db provision failed ({rc}): {err or out}"
             )
         conn = json.loads(out)
@@ -121,17 +121,17 @@ def attach_preview(
     """Point the worktree at the PR preview's database instead of a fresh one."""
     branch = branch_of(worktree)
     if not branch:
-        raise RuntimeError("cannot resolve branch of worktree")
+        raise SproutError("cannot resolve branch of worktree")
     pr = resolve_pr(repo, branch)
     if not pr:
-        raise RuntimeError(f"no open MR/PR found for branch {branch}")
+        raise SproutError(f"no open MR/PR found for branch {branch}")
     rc, out, err = sprout_cli(cfg, secrets, ["list"])
     if rc != 0:
-        raise RuntimeError(f"sprout list failed: {err or out}")
+        raise SproutError(f"sprout list failed: {err or out}")
     previews = json.loads(out).get("previews", [])
     canonical = repo.canonical_repo_id
     if not canonical:
-        raise RuntimeError(
+        raise SproutError(
             f"repos[] entry {repo.name!r} missing canonical_repo_id "
             "(required for attach-preview)"
         )
@@ -146,12 +146,12 @@ def attach_preview(
         None,
     )
     if not target:
-        raise RuntimeError(
+        raise SproutError(
             f"no sprout preview registered for {repo.name} PR/MR {pr}"
         )
     owner = secrets.get("SPROUT_PREVIEW_OWNER_URL", "").strip()
     if not owner:
-        raise RuntimeError(
+        raise SproutError(
             "SPROUT_PREVIEW_OWNER_URL required for attach-preview"
         )
     admin = urllib.parse.urlsplit(owner)
@@ -247,6 +247,6 @@ def drop_key(cfg: PluginConfig, secrets: Secrets, key: str) -> None:
         ],
     )
     if rc != 0:
-        raise RuntimeError(
+        raise SproutError(
             f"sprout worktree-db drop failed ({rc}): {err or out}"
         )

@@ -326,7 +326,7 @@ class DropLeaseTest(unittest.TestCase):
                             key=key,
                             repo="app",
                             mode="dedicated",
-                            object="",
+                            object="sprout_wt_app_feature_abc12",
                             created_at="",
                         )
                     },
@@ -336,7 +336,7 @@ class DropLeaseTest(unittest.TestCase):
                             key=key,
                             op="provision",
                             worktrees=(wt,),
-                            object_name="",
+                            object_name="sprout_wt_app_feature_abc12",
                             touch_postgres=False,
                             reserved_at="2099-01-01T00:00:00+00:00",
                         )
