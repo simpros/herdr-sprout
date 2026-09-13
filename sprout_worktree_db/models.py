@@ -23,7 +23,7 @@ class EnvInjection:
     """Connection credentials for worktree env files.
 
     ``pending_env`` is always set after a successful injection. Callers must
-    merge only after ``finalize_claim`` (while the provision lease is still
+    merge only after the provision lease finalizes (while the lease is still
     held) so a failed finalize cannot leave env pointing at a new DSN while
     state still describes the prior claim, and concurrent drop cannot race
     the deferred merge.
@@ -238,18 +238,13 @@ class SlugLease:
         return data
 
     @classmethod
-    def from_dict(cls, key: str, data: dict | str) -> SlugLease:
-        # Legacy: dropping[key] = worktree path string
-        if isinstance(data, str):
-            return cls(
-                lease_id=0,
-                key=key,
-                op="drop",
-                worktrees=(data,) if data else (),
-                object_name="",
-                touch_postgres=True,
-                reserved_at="",
-            )
+    def from_dict(cls, key: str, data: dict) -> SlugLease:
+        """Parse the modern lease object shape.
+
+        Legacy shapes (string values, ``skip_postgres``, missing ``op``,
+        ``dropping``) are normalized by :func:`migrate_legacy_state` before
+        this runs — this constructor stays boring on purpose.
+        """
         if not isinstance(data, dict):
             raise SystemExit(
                 f"corrupt state.json: leases[{key!r}] must be an object"
@@ -265,7 +260,7 @@ class SlugLease:
             raise SystemExit(
                 f"corrupt state.json: leases[{key!r}].lease_id invalid"
             ) from exc
-        raw_op = data.get("op") or "drop"
+        raw_op = data.get("op")
         if raw_op not in ("provision", "drop"):
             raise SystemExit(
                 f"corrupt state.json: leases[{key!r}].op must be "
@@ -274,9 +269,6 @@ class SlugLease:
         op: LeaseOp = "provision" if raw_op == "provision" else "drop"
         if "touch_postgres" in data:
             touch = bool(data["touch_postgres"])
-        elif "skip_postgres" in data:
-            # Legacy invert
-            touch = not bool(data["skip_postgres"])
         else:
             touch = raw_op == "drop"
         return cls(
@@ -297,9 +289,9 @@ def migrate_legacy_state(raw: dict) -> dict:
     - string lease values (``dropping[key] = worktree path``) → lease dicts.
     - ``skip_postgres`` → inverted ``touch_postgres``.
 
-    Dataclass constructors parse only the modern schema after this runs;
-    ``SlugLease.from_dict`` keeps its legacy branches as a second fence for
-    direct callers.
+    This is the single legacy fence: ``SlugLease.from_dict`` parses only the
+    modern schema after this runs, and loads persist the canonical form
+    (see ``state._read_state_file``) so the branches are paid once.
     """
     if not isinstance(raw, dict):
         return raw
@@ -383,11 +375,11 @@ class PluginState:
                 )
             by_key[record.key] = path_s
             worktrees[path_s] = record
-        # Prefer ``leases``; legacy ``dropping`` already migrated above.
+        # Legacy ``dropping`` already migrated above; only ``leases`` remains.
         raw_leases = data.get("leases") or {}
         if raw_leases and not isinstance(raw_leases, dict):
             raise SystemExit(
-                "corrupt state.json: 'leases'/'dropping' must be an object"
+                "corrupt state.json: 'leases' must be an object"
             )
         leases = {
             str(k): SlugLease.from_dict(str(k), v)

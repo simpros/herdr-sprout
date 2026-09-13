@@ -133,6 +133,53 @@ class PlanOrphansTest(unittest.TestCase):
                 [p.object_name for p in plans2], ["sprout_wt_other_orphan"]
             )
 
+    def test_live_objects_counts_finalized_provision_lease(self):
+        """Post-finalize provision rows hold a real object — count as live."""
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = Path(tmp) / "feature"
+            wt.mkdir()
+            live = {os.path.realpath(str(wt))}
+            finalized = PluginState(
+                worktrees={
+                    str(wt): WorktreeRecord(
+                        key="app-feat",
+                        repo="app",
+                        mode="dedicated",
+                        object="sprout_wt_app_feat",
+                        created_at="",
+                    )
+                },
+                leases={
+                    "app-feat": SlugLease(
+                        lease_id=1,
+                        key="app-feat",
+                        op="provision",
+                        worktrees=(str(wt),),
+                        object_name="",
+                        touch_postgres=False,
+                        reserved_at="2099-01-01T00:00:00+00:00",
+                    )
+                },
+            )
+            self.assertEqual(
+                gc_mod.live_objects_from_state(finalized, live),
+                {"sprout_wt_app_feat"},
+            )
+            # Pre-finalize row (empty object) holds the slug only.
+            pending = PluginState(
+                worktrees={
+                    str(wt): WorktreeRecord(
+                        key="app-feat",
+                        repo="app",
+                        mode="dedicated",
+                        object="",
+                        created_at="",
+                    )
+                },
+                leases=dict(finalized.leases),
+            )
+            self.assertEqual(gc_mod.live_objects_from_state(pending, live), set())
+
     def test_plan_skips_leased_rows(self):
         with tempfile.TemporaryDirectory() as tmp:
             gone = str(Path(tmp) / "gone")

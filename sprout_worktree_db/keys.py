@@ -1,8 +1,7 @@
 """Pure slug / object-key math (no I/O).
 
 Extracted from ``state.py`` so the key rules have one home with no lock,
-file, or lease concerns. ``state.py`` re-exports these names for backward
-compatibility (``state.mint_key`` etc. keep working).
+file, or lease concerns. Import from here — not via ``state``.
 """
 
 from __future__ import annotations

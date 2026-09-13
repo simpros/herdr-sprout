@@ -6,11 +6,10 @@ import json
 import os
 from datetime import datetime, timezone
 
-from sprout_worktree_db.drop import do_drop, execute_drop_lease  # noqa: F401 — compat re-export
 from sprout_worktree_db.envfile import merge_env_file
 from sprout_worktree_db.gitutil import repo_config
+from sprout_worktree_db.leases import claim_provision
 from sprout_worktree_db.models import (
-    DropRequest,  # noqa: F401 — compat re-export for drop callers
     EnvInjection,
     PluginConfig,
     ProvisionRequest,
@@ -18,7 +17,6 @@ from sprout_worktree_db.models import (
     WorktreeRecord,
 )
 from sprout_worktree_db.paths import config_path, log
-from sprout_worktree_db.state import claim_provision
 from sprout_worktree_db.steps import run_steps
 from sprout_worktree_db.sprout import attach_preview, provision_dedicated
 

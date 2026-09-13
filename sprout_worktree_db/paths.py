@@ -42,17 +42,32 @@ def state_dir() -> Path:
     return Path.home() / ".local" / "state" / "herdr" / "plugins" / PLUGIN_ID
 
 
+def _migrate_legacy_file(primary: Path, legacy: Path, kind: str) -> Path:
+    """Copy a legacy file into place once; fall back to legacy on failure.
+
+    The legacy file is left in place — never destroy user data on a
+    best-effort migration.
+    """
+    try:
+        primary.parent.mkdir(parents=True, exist_ok=True)
+        primary.write_bytes(legacy.read_bytes())
+    except OSError as exc:
+        log(
+            f"using legacy {kind} {legacy} (migrate to "
+            f"{primary} to silence this warning: {exc})"
+        )
+        return legacy
+    log(f"migrated legacy {kind} {legacy} -> {primary}")
+    return primary
+
+
 def config_path() -> Path:
     primary = config_dir() / "config.json"
     if primary.exists():
         return primary
     legacy = LEGACY_CONFIG_DIR / "worktree-db.json"
     if legacy.exists():
-        log(
-            f"using legacy config {legacy} (migrate to "
-            f"{primary} to silence this warning)"
-        )
-        return legacy
+        return _migrate_legacy_file(primary, legacy, "config")
     return primary
 
 
@@ -62,11 +77,7 @@ def secrets_path() -> Path:
         return primary
     legacy = LEGACY_CONFIG_DIR / "worktree-db.env"
     if legacy.exists():
-        log(
-            f"using legacy secrets {legacy} (migrate to "
-            f"{primary} to silence this warning)"
-        )
-        return legacy
+        return _migrate_legacy_file(primary, legacy, "secrets")
     return primary
 
 

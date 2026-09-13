@@ -8,17 +8,16 @@ import shutil
 
 from sprout_worktree_db.drop import execute_drop_lease
 from sprout_worktree_db.gitutil import git_worktree_paths, run
+from sprout_worktree_db.keys import key_from_object, postgres_target
+from sprout_worktree_db.leases import reserve_from_plan
 from sprout_worktree_db.models import DropOp, PluginConfig, PluginState, Secrets, SlugLease
 from sprout_worktree_db.paths import log, require_admin_url
 from sprout_worktree_db.state import (
     expired_lease_keys,
-    key_from_object,
     load_state,
     locked_state,
     path_for_key,
-    postgres_target,
     reclaim_expired_leases,
-    reserve_from_plan,
 )
 
 
@@ -46,7 +45,13 @@ def live_objects_from_state(
         real = os.path.realpath(path) if path else ""
         if not (os.path.exists(path) or real in live_paths):
             continue
-        if rec.key in state.leases:
+        lease = state.leases.get(rec.key)
+        if lease is not None and not (
+            lease.op == "provision" and rec.object
+        ):
+            # Drop leases (and pre-finalize provision rows with no object
+            # yet) hold the slug only — touch_postgres drop leases are
+            # counted live via the lease loop below.
             continue
         obj, touch = postgres_target(rec, rec.key)
         if touch and obj:

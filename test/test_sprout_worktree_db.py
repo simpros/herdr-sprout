@@ -21,7 +21,7 @@ from sprout_worktree_db.models import (  # noqa: E402
     RepoConfig,
     WorktreeRecord,
 )
-from sprout_worktree_db.state import (  # noqa: E402
+from sprout_worktree_db.keys import (  # noqa: E402
     mint_key,
     normalize_key,
     object_name,
