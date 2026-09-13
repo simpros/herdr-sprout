@@ -410,7 +410,7 @@ class SlugLeaseTest(unittest.TestCase):
         self.assertIn("leases", st.to_dict())
 
     def test_legacy_shape_writes_back_canonical(self):
-        """Legacy on disk is migrated once; later loads see modern schema."""
+        """Legacy persists lazily: unlocked reads stay read-only."""
         with tempfile.TemporaryDirectory() as tmp:
             os.environ["HERDR_PLUGIN_STATE_DIR"] = tmp
             try:
@@ -436,14 +436,105 @@ class SlugLeaseTest(unittest.TestCase):
                 st = state.load_state()
                 self.assertIn("app-x", st.leases)
                 self.assertEqual(st.leases["app-x"].op, "drop")
+                # Unlocked load must not persist (no lock-free write-back).
                 raw = json.loads(path.read_text())
-                self.assertNotIn("dropping", raw)
-                self.assertIn("leases", raw)
-                # Second load parses the modern schema with no legacy tax.
+                self.assertIn("dropping", raw)
+                # Next locked mutation persists the canonical form.
+                with state.locked_state():
+                    pass
+                raw2 = json.loads(path.read_text())
+                self.assertNotIn("dropping", raw2)
+                self.assertIn("leases", raw2)
                 st2 = state.load_state()
                 self.assertIn("app-x", st2.leases)
             finally:
                 del os.environ["HERDR_PLUGIN_STATE_DIR"]
+
+    def test_legacy_string_lease_under_leases(self):
+        st = PluginState.from_dict(
+            {"worktrees": {}, "leases": {"a": "/wt"}}
+        )
+        self.assertEqual(st.leases["a"].op, "drop")
+        self.assertEqual(st.leases["a"].worktrees, ("/wt",))
+        self.assertTrue(st.leases["a"].touch_postgres)
+
+    def test_legacy_missing_op_under_leases(self):
+        st = PluginState.from_dict(
+            {
+                "worktrees": {},
+                "leases": {
+                    "b": {
+                        "lease_id": 1,
+                        "worktrees": ["/wt"],
+                        "touch_postgres": True,
+                    }
+                },
+            }
+        )
+        self.assertEqual(st.leases["b"].op, "drop")
+
+    def test_legacy_skip_postgres_inverts_on_write_back(self):
+        st = PluginState.from_dict(
+            {
+                "worktrees": {},
+                "leases": {
+                    "c": {
+                        "lease_id": 1,
+                        "op": "drop",
+                        "worktrees": ["/wt"],
+                        "skip_postgres": True,
+                    }
+                },
+            }
+        )
+        self.assertFalse(st.leases["c"].touch_postgres)
+        data = st.to_dict()
+        self.assertFalse(data["leases"]["c"]["touch_postgres"])
+        self.assertNotIn("skip_postgres", data["leases"]["c"])
+
+    def test_legacy_empty_leases_merges_dropping(self):
+        st = PluginState.from_dict(
+            {
+                "worktrees": {},
+                "leases": {},
+                "dropping": {"k": "/wt"},
+            }
+        )
+        self.assertIn("k", st.leases)
+        self.assertNotIn("dropping", st.to_dict())
+
+    def test_legacy_leases_wins_on_conflict(self):
+        st = PluginState.from_dict(
+            {
+                "worktrees": {},
+                "leases": {
+                    "k": {
+                        "lease_id": 9,
+                        "op": "drop",
+                        "worktrees": ["/a"],
+                        "touch_postgres": False,
+                    }
+                },
+                "dropping": {"k": "/b"},
+            }
+        )
+        self.assertEqual(st.leases["k"].lease_id, 9)
+        self.assertEqual(st.leases["k"].worktrees, ("/a",))
+
+    def test_modern_missing_touch_is_corrupt(self):
+        with self.assertRaises(SystemExit):
+            PluginState.from_dict(
+                {
+                    "worktrees": {},
+                    "leases": {
+                        "x": {
+                            "lease_id": 1,
+                            "op": "drop",
+                            "worktrees": [],
+                        }
+                    },
+                }
+            )
 
     def test_expired_lease_reclaimed(self):
         with tempfile.TemporaryDirectory() as tmp:

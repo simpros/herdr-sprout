@@ -239,11 +239,12 @@ class SlugLease:
 
     @classmethod
     def from_dict(cls, key: str, data: dict) -> SlugLease:
-        """Parse the modern lease object shape.
+        """Parse the modern lease object shape (strict).
 
         Legacy shapes (string values, ``skip_postgres``, missing ``op``,
-        ``dropping``) are normalized by :func:`migrate_legacy_state` before
-        this runs — this constructor stays boring on purpose.
+        ``dropping``) are normalized by :func:`normalize_state_dict`
+        before this runs — this constructor stays boring on purpose.
+        ``touch_postgres`` is required; absence is corrupt, not defaulted.
         """
         if not isinstance(data, dict):
             raise SystemExit(
@@ -267,10 +268,12 @@ class SlugLease:
                 "'provision' or 'drop'"
             )
         op: LeaseOp = "provision" if raw_op == "provision" else "drop"
-        if "touch_postgres" in data:
-            touch = bool(data["touch_postgres"])
-        else:
-            touch = raw_op == "drop"
+        if "touch_postgres" not in data:
+            raise SystemExit(
+                f"corrupt state.json: leases[{key!r}] missing "
+                "'touch_postgres' (fix or remove the row)"
+            )
+        touch = bool(data["touch_postgres"])
         return cls(
             lease_id=lease_id,
             key=key,
@@ -282,47 +285,103 @@ class SlugLease:
         )
 
 
-def migrate_legacy_state(raw: dict) -> dict:
-    """One-shot normalize of legacy shapes into the canonical schema.
+def _normalize_lease_entry(
+    key: str, val: object, *, default_op: LeaseOp
+) -> tuple[object, bool]:
+    """Normalize one lease value; return ``(canonical, was_legacy)``.
 
-    - ``dropping`` (all op=drop) → ``leases``.
-    - string lease values (``dropping[key] = worktree path``) → lease dicts.
-    - ``skip_postgres`` → inverted ``touch_postgres``.
+    Single fence for every value under ``dropping`` and ``leases``:
+    coerce strings, invert ``skip_postgres`` (``touch`` wins when both
+    are present), ``setdefault("op", default_op)``. Non-dict/non-string
+    values pass through untouched so :meth:`SlugLease.from_dict` fails
+    closed as corrupt.
+    """
+    if isinstance(val, str):
+        return (
+            {
+                "lease_id": 0,
+                "op": default_op,
+                "worktrees": [val] if val else [],
+                "object_name": "",
+                "touch_postgres": True,
+            },
+            True,
+        )
+    if not isinstance(val, dict):
+        return val, False
+    entry = dict(val)
+    was_legacy = False
+    if "skip_postgres" in entry:
+        was_legacy = True
+        skip = entry.pop("skip_postgres")
+        if "touch_postgres" not in entry:
+            entry["touch_postgres"] = not bool(skip)
+    if "op" not in entry:
+        was_legacy = True
+        entry["op"] = default_op
+    elif entry.get("op") not in ("provision", "drop"):
+        # Corrupt op — leave for from_dict to reject; not legacy.
+        return entry, was_legacy
+    if default_op == "drop" and "touch_postgres" not in entry and was_legacy:
+        # Dropping-sourced dicts without any touch signal default to a
+        # real Postgres drop (the only legacy drop semantic).
+        entry["touch_postgres"] = True
+    return entry, was_legacy
 
-    This is the single legacy fence: ``SlugLease.from_dict`` parses only the
-    modern schema after this runs, and loads persist the canonical form
-    (see ``state._read_state_file``) so the branches are paid once.
+
+def normalize_state_dict(raw: dict) -> tuple[dict, bool]:
+    """Single legacy fence: canonicalize + report ``was_legacy``.
+
+    Always folds ``dropping`` into ``leases`` (``leases`` wins on key
+    conflict), normalizes every lease value via
+    :func:`_normalize_lease_entry`, and pops ``dropping``. Derive
+    ``was_legacy`` here — callers must not keep a parallel detector.
     """
     if not isinstance(raw, dict):
-        return raw
+        return raw, False
     data = dict(raw)
-    leases = data.get("leases")
-    if leases is None:
-        legacy = data.get("dropping") or {}
-        if isinstance(legacy, dict):
-            converted: dict = {}
-            for key, val in legacy.items():
-                if isinstance(val, str):
-                    converted[key] = {
-                        "lease_id": 0,
-                        "op": "drop",
-                        "worktrees": [val] if val else [],
-                        "object_name": "",
-                        "touch_postgres": True,
-                    }
-                elif isinstance(val, dict):
-                    entry = dict(val)
-                    entry.setdefault("op", "drop")
-                    if "touch_postgres" not in entry and "skip_postgres" in entry:
-                        entry["touch_postgres"] = not bool(
-                            entry.pop("skip_postgres")
-                        )
-                    converted[key] = entry
-                else:
-                    converted[key] = val
-            data["leases"] = converted
-            data.pop("dropping", None)
-    return data
+    was_legacy = False
+    if "dropping" in data:
+        was_legacy = True
+    raw_dropping = data.get("dropping")
+    if raw_dropping is not None and not isinstance(raw_dropping, dict):
+        raise SystemExit(
+            "corrupt state.json: 'dropping' must be an object"
+        )
+    raw_leases = data.get("leases")
+    if raw_leases is not None and not isinstance(raw_leases, dict):
+        raise SystemExit("corrupt state.json: 'leases' must be an object")
+    canonical: dict = {}
+    for k, v in (raw_leases or {}).items():
+        norm, legacy = _normalize_lease_entry(str(k), v, default_op="drop")
+        was_legacy = was_legacy or legacy
+        canonical[str(k)] = norm
+    for k, v in (raw_dropping or {}).items():
+        if str(k) in canonical:
+            continue  # leases wins on key conflict
+        norm, _ = _normalize_lease_entry(str(k), v, default_op="drop")
+        # Dropping-sourced rows are legacy by construction (key presence
+        # already set was_legacy); the per-entry flag is subsumed.
+        canonical[str(k)] = norm
+    data["leases"] = canonical
+    data.pop("dropping", None)
+    return data, was_legacy
+
+
+def migrate_legacy_state(raw: dict) -> dict:
+    """Back-compat wrapper — prefer :func:`normalize_state_dict`.
+
+    One-shot normalize of legacy shapes into the canonical schema.
+    ``SlugLease.from_dict`` parses only the modern schema after this
+    runs; locked mutations persist the canonical form lazily (see
+    ``state.locked_state``) so the branches are paid once.
+    """
+    canonical, _ = normalize_state_dict(raw)
+    if not isinstance(raw, dict):
+        return raw
+    # Preserve the old "leases is None → dropping only" contract shape:
+    # callers that only read the dict get the canonical leases either way.
+    return canonical
 
 
 @dataclass

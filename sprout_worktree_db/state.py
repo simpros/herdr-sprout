@@ -28,23 +28,15 @@ from sprout_worktree_db.paths import LEGACY_CONFIG_DIR, state_path
 LEASE_TTL_SECONDS = 3600
 
 
-def _is_legacy_shape(data: dict) -> bool:
-    """True when the raw JSON still carries a pre-leases schema."""
-    if "dropping" in data:
-        return True
-    leases = data.get("leases")
-    if isinstance(leases, dict):
-        for value in leases.values():
-            if isinstance(value, str):
-                return True
-            if isinstance(value, dict) and (
-                "skip_postgres" in value or "op" not in value
-            ):
-                return True
-    return False
-
-
 def _read_state_file() -> PluginState:
+    """Read-only parse of state.json (never persists).
+
+    Legacy shapes are normalized in memory by
+    :func:`models.normalize_state_dict`; the canonical form is persisted
+    lazily by the next :func:`locked_state` mutation — never from this
+    lock-free read path, so concurrent status/GC readers cannot tear
+    the write.
+    """
     primary = state_path()
     path = primary
     if not path.exists():
@@ -70,13 +62,6 @@ def _read_state_file() -> PluginState:
             "refusing to wipe claims"
         )
     state = PluginState.from_dict(data)
-    if path != primary or _is_legacy_shape(data):
-        # One-shot migrate: persist the canonical form so later loads
-        # parse only the modern schema (legacy file left in place).
-        try:
-            save_state(state)
-        except OSError:
-            pass
     return state
 
 
@@ -96,7 +81,11 @@ def save_state(state: PluginState) -> None:
 
 @contextmanager
 def locked_state() -> Iterator[PluginState]:
-    """Exclusive lock around load → mutate → save of state.json."""
+    """Exclusive lock around load → mutate → save of state.json.
+
+    The exit save also persists any in-memory legacy normalization in
+    canonical form, so unlocked readers stay read-only.
+    """
     path = state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_suffix(path.suffix + ".lock")
