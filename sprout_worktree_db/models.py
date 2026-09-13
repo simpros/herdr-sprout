@@ -309,8 +309,8 @@ class DropOp:
 
     ``touch_postgres`` is authoritative: ``--forget-only`` is encoded when the
     op is created (False), not re-OR'd at execute time. ``paths`` is the
-    forget-set hint (claim path and/or remint extras); reserve expands via
-    ``path_for_key``. ``reason`` is GC log context only.
+    authoritative forget-set (stored verbatim on the lease; no second
+    expansion). ``reason`` is GC log context only.
 
     Deliberately distinct from :class:`SlugLease`: plans are pre-lock input
     (GC builds them lock-free, then reserves under an already-held lock),

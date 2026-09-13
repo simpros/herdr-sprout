@@ -50,14 +50,6 @@ def _busy_msg(key: str, lease: SlugLease) -> str:
     return f"key {key!r}: {lease.op} in progress"
 
 
-def _forget_set(
-    state: PluginState, key: str, extra: tuple[str, ...] = ()
-) -> tuple[str, ...]:
-    """Forget-set: the unique claim path for key, plus remint extras."""
-    claim = path_for_key(state, key)
-    return tuple(dict.fromkeys(p for p in (claim, *extra) if p))
-
-
 def _mint_lease(
     state: PluginState,
     key: str,
@@ -69,10 +61,10 @@ def _mint_lease(
 ) -> SlugLease:
     """Single lease constructor — one id sequence, no op switchboard.
 
-    Provision callers pass the in-flight worktree directly (the claim row
-    is the forget-set, so no expansion). Drop callers pre-expand via
-    :func:`_forget_set` and pass the baked ``object_name`` /
-    ``touch_postgres``.
+    ``worktrees`` is authoritative: each resolve branch emits the exact
+    forget-set (no hint + expand). Provision passes the in-flight path;
+    ``--key`` passes ``(path_for_key(key),)`` or ``()``; row passes
+    ``(wt,)``; remint passes ``(wt,)`` as a busy-fence only.
     """
     lease_id = state.next_lease_id
     state.next_lease_id = lease_id + 1
@@ -284,6 +276,9 @@ def _reserve(
 ) -> SlugLease | None:
     """Exclusive drop-slug reservation. Returns None if busy (unless steal).
 
+    ``worktrees`` is stored verbatim — the authoritative forget-set from
+    the resolver. No claim ∪ extras merge: callers emit the exact set.
+
     ``steal`` only clears a stuck *drop* lease. In-flight provision leases
     stay exclusive until TTL expiry or ``gc --reclaim-leases``.
     """
@@ -298,7 +293,7 @@ def _reserve(
         state,
         key,
         op="drop",
-        worktrees=_forget_set(state, key, worktrees),
+        worktrees=worktrees,
         object_name=object_name,
         touch_postgres=touch_postgres,
     )
@@ -319,10 +314,14 @@ def _drop_target(
     ``forget_only`` is encoded here, once, as ``touch_postgres=False`` —
     the op owns the flag from creation; no caller overrides it afterwards.
 
-    ``--key`` is authoritative when given: the forget-set is only
-    ``path_for_key(key)`` — never the caller's worktree. Passing both
-    flags requires agreement (fail closed) so a key-resolved drop can
-    never pop a foreign claim via ``finish_drop``.
+    ``DropOp.paths`` is authoritative (no second expansion in ``_reserve``):
+
+    - ``--key``: ``(path_for_key(key),)`` when claimed, else ``()``.
+      Passing both flags requires agreement (fail closed) so a
+      key-resolved drop can never pop a foreign claim via ``finish_drop``.
+    - row: ``(wt,)`` — the claimed path itself.
+    - remint: ``(wt,)`` busy-fence only; the slug must be unclaimed or
+      this raises (same ownership rule as provision claim).
     """
     wt = worktree
 
@@ -343,7 +342,7 @@ def _drop_target(
                 f"(owns {path!r}); pass only one of --key / --worktree"
             )
         obj, touch = postgres_target(rec, requested_key)
-        return _bake(requested_key, obj, touch, ())
+        return _bake(requested_key, obj, touch, (path,) if path else ())
 
     if wt is not None:
         record = state.worktrees.get(wt)
@@ -354,6 +353,12 @@ def _drop_target(
             if wt in res.worktrees:
                 raise BusyError(_busy_msg(res.key, res))
         if remint_key is not None:
+            holder = path_for_key(state, remint_key)
+            if holder is not None:
+                raise BusyError(
+                    f"key {remint_key!r} already claimed by {holder}; "
+                    "drop that worktree first"
+                )
             obj, touch = postgres_target(None, remint_key)
             return _bake(remint_key, obj, touch, (wt,))
         raise ConfigError(

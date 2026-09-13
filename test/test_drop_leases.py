@@ -579,6 +579,70 @@ class DropLeaseTest(unittest.TestCase):
             finally:
                 del os.environ["HERDR_PLUGIN_STATE_DIR"]
 
+    def test_remint_claimed_elsewhere_refused(self):
+        """Remint of B for a slug A owns: refuse, keep A's claim.
+
+        Regression: remint used to merge the foreign claim into the
+        forget-set via ``_forget_set`` so ``finish_drop`` wiped A.
+        ``DropOp.paths`` is now authoritative and the resolver fails
+        closed on ownership (same rule as provision claim).
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["HERDR_PLUGIN_STATE_DIR"] = tmp
+            try:
+                a = os.path.realpath(str(Path(tmp) / "a"))
+                b = os.path.realpath(str(Path(tmp) / "b"))
+                Path(a).mkdir()
+                Path(b).mkdir()
+                remint = mint_key(b, repo("myapp"))
+                st = PluginState(
+                    worktrees={
+                        a: WorktreeRecord(
+                            key=remint,
+                            repo="myapp",
+                            mode="dedicated",
+                            object=object_name(remint),
+                            created_at="",
+                        )
+                    }
+                )
+                state.save_state(st)
+                with self.assertRaises(PluginError) as ctx:
+                    begin_drop(b, remint_key=remint, forget_only=True)
+                self.assertIn("already claimed", str(ctx.exception))
+                after = state.load_state()
+                self.assertIn(a, after.worktrees)
+                self.assertNotIn(remint, after.leases)
+            finally:
+                del os.environ["HERDR_PLUGIN_STATE_DIR"]
+
+    def test_key_resolved_forget_set_is_claim_only(self):
+        """--key alone: lease worktrees is the claim path, never empty."""
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["HERDR_PLUGIN_STATE_DIR"] = tmp
+            try:
+                a = os.path.realpath(str(Path(tmp) / "a"))
+                Path(a).mkdir()
+                st = PluginState(
+                    worktrees={
+                        a: WorktreeRecord(
+                            key="key-a",
+                            repo="app",
+                            mode="dedicated",
+                            object="sprout_wt_key_a",
+                            created_at="",
+                        )
+                    }
+                )
+                state.save_state(st)
+                lease = begin_drop(requested="key-a", forget_only=True)
+                self.assertEqual(lease.key, "key-a")
+                self.assertEqual(lease.worktrees, (a,))
+                finish_drop(lease)
+                self.assertNotIn(a, state.load_state().worktrees)
+            finally:
+                del os.environ["HERDR_PLUGIN_STATE_DIR"]
+
 
 class ExecuteDropLeaseAbortTest(unittest.TestCase):
     """SproutError must abort the lease — never leave it stuck.
