@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -10,6 +11,11 @@ from typing import Literal
 Mode = Literal["dedicated", "preview"]
 StepsStatus = Literal["ok", "skipped", "failed"]
 LeaseOp = Literal["provision", "drop"]
+
+# Secrets flow end-to-end as string mappings (parsed once in paths.py).
+Secrets = Mapping[str, str]
+# Step rows are small JSON-ish dicts (cmd / ok / error / skipped / seconds).
+StepRecord = dict[str, object]
 
 
 @dataclass(frozen=True)
@@ -38,7 +44,7 @@ class RepoConfig:
     main_repo: str
     env_files: tuple[str, ...]
     renames: dict[str, str] = field(default_factory=dict)
-    steps: tuple[dict, ...] = field(default_factory=tuple)
+    steps: tuple[StepRecord, ...] = field(default_factory=tuple)
     requires_node_modules: bool = False
     worktrees_root: str | None = None
     canonical_repo_id: str | None = None
@@ -76,7 +82,7 @@ class RepoConfig:
             raise SystemExit(
                 f"repos[] entry {name!r}: 'steps' must be an array"
             )
-        steps: list[dict] = []
+        steps: list[StepRecord] = []
         for raw in raw_steps:
             if isinstance(raw, list):
                 steps.append({"cmd": raw})
@@ -145,7 +151,7 @@ class WorktreeRecord:
     object: str
     created_at: str
     env_files: list[str] = field(default_factory=list)
-    steps: list[dict] = field(default_factory=list)
+    steps: list[StepRecord] = field(default_factory=list)
     pr_id: int | None = None
     preview_url: str | None = None
 
@@ -265,6 +271,7 @@ class SlugLease:
                 f"corrupt state.json: leases[{key!r}].op must be "
                 "'provision' or 'drop'"
             )
+        op: LeaseOp = "provision" if raw_op == "provision" else "drop"
         if "touch_postgres" in data:
             touch = bool(data["touch_postgres"])
         elif "skip_postgres" in data:
@@ -275,12 +282,55 @@ class SlugLease:
         return cls(
             lease_id=lease_id,
             key=key,
-            op=raw_op,  # type: ignore[arg-type]
+            op=op,
             worktrees=tuple(str(p) for p in raw_wts if str(p)),
             object_name=str(data.get("object_name") or ""),
             touch_postgres=touch,
             reserved_at=str(data.get("reserved_at") or ""),
         )
+
+
+def migrate_legacy_state(raw: dict) -> dict:
+    """One-shot normalize of legacy shapes into the canonical schema.
+
+    - ``dropping`` (all op=drop) → ``leases``.
+    - string lease values (``dropping[key] = worktree path``) → lease dicts.
+    - ``skip_postgres`` → inverted ``touch_postgres``.
+
+    Dataclass constructors parse only the modern schema after this runs;
+    ``SlugLease.from_dict`` keeps its legacy branches as a second fence for
+    direct callers.
+    """
+    if not isinstance(raw, dict):
+        return raw
+    data = dict(raw)
+    leases = data.get("leases")
+    if leases is None:
+        legacy = data.get("dropping") or {}
+        if isinstance(legacy, dict):
+            converted: dict = {}
+            for key, val in legacy.items():
+                if isinstance(val, str):
+                    converted[key] = {
+                        "lease_id": 0,
+                        "op": "drop",
+                        "worktrees": [val] if val else [],
+                        "object_name": "",
+                        "touch_postgres": True,
+                    }
+                elif isinstance(val, dict):
+                    entry = dict(val)
+                    entry.setdefault("op", "drop")
+                    if "touch_postgres" not in entry and "skip_postgres" in entry:
+                        entry["touch_postgres"] = not bool(
+                            entry.pop("skip_postgres")
+                        )
+                    converted[key] = entry
+                else:
+                    converted[key] = val
+            data["leases"] = converted
+            data.pop("dropping", None)
+    return data
 
 
 @dataclass
@@ -306,6 +356,7 @@ class PluginState:
 
     @classmethod
     def from_dict(cls, data: dict) -> PluginState:
+        data = migrate_legacy_state(data)
         raw = data.get("worktrees") or {}
         if not isinstance(raw, dict):
             raise SystemExit("corrupt state.json: 'worktrees' must be an object")
@@ -332,10 +383,8 @@ class PluginState:
                 )
             by_key[record.key] = path_s
             worktrees[path_s] = record
-        # Prefer ``leases``; migrate legacy ``dropping`` (all op=drop).
-        raw_leases = data.get("leases")
-        if raw_leases is None:
-            raw_leases = data.get("dropping") or {}
+        # Prefer ``leases``; legacy ``dropping`` already migrated above.
+        raw_leases = data.get("leases") or {}
         if raw_leases and not isinstance(raw_leases, dict):
             raise SystemExit(
                 "corrupt state.json: 'leases'/'dropping' must be an object"

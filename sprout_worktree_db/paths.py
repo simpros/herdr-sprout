@@ -48,6 +48,10 @@ def config_path() -> Path:
         return primary
     legacy = LEGACY_CONFIG_DIR / "worktree-db.json"
     if legacy.exists():
+        log(
+            f"using legacy config {legacy} (migrate to "
+            f"{primary} to silence this warning)"
+        )
         return legacy
     return primary
 
@@ -58,6 +62,10 @@ def secrets_path() -> Path:
         return primary
     legacy = LEGACY_CONFIG_DIR / "worktree-db.env"
     if legacy.exists():
+        log(
+            f"using legacy secrets {legacy} (migrate to "
+            f"{primary} to silence this warning)"
+        )
         return legacy
     return primary
 

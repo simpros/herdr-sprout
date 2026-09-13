@@ -1,4 +1,4 @@
-"""Provision / drop orchestration."""
+"""Provision orchestration (straight-line session over a provision lease)."""
 
 from __future__ import annotations
 
@@ -6,29 +6,21 @@ import json
 import os
 from datetime import datetime, timezone
 
+from sprout_worktree_db.drop import do_drop, execute_drop_lease  # noqa: F401 — compat re-export
 from sprout_worktree_db.envfile import merge_env_file
 from sprout_worktree_db.gitutil import repo_config
 from sprout_worktree_db.models import (
-    DropRequest,
+    DropRequest,  # noqa: F401 — compat re-export for drop callers
     EnvInjection,
     PluginConfig,
     ProvisionRequest,
-    SlugLease,
+    Secrets,
     WorktreeRecord,
 )
 from sprout_worktree_db.paths import config_path, log
-from sprout_worktree_db.state import (
-    abort_claim,
-    abort_drop,
-    begin_drop,
-    claim_key,
-    finalize_claim,
-    finish_drop,
-    release_claim,
-    update_claim_steps,
-)
+from sprout_worktree_db.state import claim_provision
 from sprout_worktree_db.steps import run_steps
-from sprout_worktree_db.sprout import attach_preview, drop_key, provision_dedicated
+from sprout_worktree_db.sprout import attach_preview, provision_dedicated
 
 
 def _apply_pending_env(injection: EnvInjection) -> None:
@@ -37,7 +29,7 @@ def _apply_pending_env(injection: EnvInjection) -> None:
 
 
 def do_provision(
-    cfg: PluginConfig, secrets: dict, req: ProvisionRequest
+    cfg: PluginConfig, secrets: Secrets, req: ProvisionRequest
 ) -> dict:
     worktree = os.path.realpath(req.worktree)
     if not os.path.isdir(worktree):
@@ -49,23 +41,22 @@ def do_provision(
             f"(add a repos[] entry with matching main_repo to {config_path()})"
         )
 
-    key, lease_id = claim_key(
+    with claim_provision(
         worktree, repo, mode=req.mode, requested=req.key
-    )
-    log(
-        f"provision [{req.mode}] worktree={worktree} key={key} repo={repo.name}"
-    )
-
-    try:
+    ) as lease:
+        log(
+            f"provision [{req.mode}] worktree={worktree} "
+            f"key={lease.key} repo={repo.name}"
+        )
         if req.mode == "preview":
             injection = attach_preview(cfg, secrets, repo, worktree)
         else:
             injection = provision_dedicated(
-                cfg, secrets, repo, worktree, key
+                cfg, secrets, repo, worktree, lease.key
             )
 
         record = WorktreeRecord(
-            key=key,
+            key=lease.key,
             repo=repo.name,
             mode=req.mode,
             object=injection.object_name,
@@ -76,13 +67,9 @@ def do_provision(
             preview_url=injection.preview_url,
         )
         # Finalize gates disk truth: env + steps only after the claim sticks.
-        # Keep the provision lease through env/steps so drop/GC cannot race.
-        finalize_claim(worktree, key, lease_id, record)
-    except Exception:
-        abort_claim(worktree, key, lease_id)
-        raise
+        # The provision lease is held through env/steps so drop/GC cannot race.
+        lease.finalize(record)
 
-    try:
         _apply_pending_env(injection)
         steps = (
             run_steps(cfg, secrets, repo, worktree)
@@ -91,9 +78,7 @@ def do_provision(
         )
         if steps:
             record.steps = steps
-            update_claim_steps(worktree, key, lease_id, steps)
-    finally:
-        release_claim(worktree, key, lease_id)
+            lease.record_steps(steps)
 
     payload = record.to_dict()
     log(
@@ -102,65 +87,3 @@ def do_provision(
     )
     print(json.dumps({"ok": True, **payload}, indent=2))
     return payload
-
-
-def execute_drop_lease(
-    cfg: PluginConfig,
-    secrets: dict,
-    lease: SlugLease,
-    *,
-    reraise: bool,
-) -> bool:
-    """One lease lifecycle: skip / drop_key → finish, or abort on failure.
-
-    ``lease.touch_postgres`` is authoritative (forget-only baked in at begin).
-    Returns True when Postgres drop ran successfully.
-    """
-    if not lease.touch_postgres:
-        finish_drop(lease)
-        return False
-    try:
-        drop_key(cfg, secrets, lease.key)
-        finish_drop(lease)
-        return True
-    except Exception as exc:
-        abort_drop(lease)
-        if reraise:
-            raise
-        log(f"drop failed for {lease.key}: {exc}")
-        return False
-
-
-def do_drop(cfg: PluginConfig, secrets: dict, req: DropRequest) -> dict:
-    """Begin drop lease → Postgres drop → finish (inverse of claim)."""
-    worktree = os.path.realpath(req.worktree) if req.worktree else None
-    lease = begin_drop(
-        cfg,
-        worktree,
-        requested=req.key,
-        force=req.force,
-        forget_only=req.forget_only,
-    )
-
-    if not lease.touch_postgres:
-        reason = (
-            "--forget-only"
-            if req.forget_only
-            else "leaving shared/preview DB intact"
-        )
-        log(f"forgetting claim for {lease.key}; {reason}")
-    dropped = execute_drop_lease(cfg, secrets, lease, reraise=True)
-    if dropped:
-        log(f"dropped {lease.object_name or lease.key}")
-    print(
-        json.dumps(
-            {
-                "ok": True,
-                "key": lease.key,
-                "dropped": dropped,
-                "forgot_only": not lease.touch_postgres,
-            },
-            indent=2,
-        )
-    )
-    return {"key": lease.key}

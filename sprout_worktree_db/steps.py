@@ -10,12 +10,18 @@ import urllib.parse
 from pathlib import Path
 
 from sprout_worktree_db.gitutil import run
-from sprout_worktree_db.models import PluginConfig, RepoConfig, StepsStatus
+from sprout_worktree_db.models import (
+    PluginConfig,
+    RepoConfig,
+    Secrets,
+    StepRecord,
+    StepsStatus,
+)
 from sprout_worktree_db.paths import clean_env, log, require_admin_url
 from sprout_worktree_db.sprout import target_name
 
 
-def steps_status(steps: list[dict]) -> StepsStatus | None:
+def steps_status(steps: list[StepRecord]) -> StepsStatus | None:
     """Ternary status: ok | skipped | failed (None when no steps ran)."""
     if not steps:
         return None
@@ -27,9 +33,9 @@ def steps_status(steps: list[dict]) -> StepsStatus | None:
 
 
 def run_steps(
-    cfg: PluginConfig, secrets: dict, repo: RepoConfig, worktree: str
-) -> list[dict]:
-    results: list[dict] = []
+    cfg: PluginConfig, secrets: Secrets, repo: RepoConfig, worktree: str
+) -> list[StepRecord]:
+    results: list[StepRecord] = []
     bun = cfg.bun or shutil.which("bun") or "bun"
     if repo.requires_node_modules and not (
         Path(worktree) / "node_modules"

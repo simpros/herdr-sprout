@@ -9,9 +9,10 @@ import os
 from sprout_worktree_db.event import event_worktree_path
 from sprout_worktree_db.gc import gc
 from sprout_worktree_db.gitutil import repo_config
-from sprout_worktree_db.models import DropRequest, PluginConfig, ProvisionRequest
+from sprout_worktree_db.models import DropRequest, PluginConfig, ProvisionRequest, Secrets
 from sprout_worktree_db.paths import load_config, load_secrets, log
-from sprout_worktree_db.provision import do_drop, do_provision
+from sprout_worktree_db.drop import do_drop
+from sprout_worktree_db.provision import do_provision
 from sprout_worktree_db.state import claim_status, load_state
 from sprout_worktree_db.steps import steps_status
 
@@ -105,7 +106,7 @@ def hook(event: str) -> int:
 
 def _provision_from_args(
     cfg: PluginConfig,
-    secrets: dict,
+    secrets: Secrets,
     worktree: str,
     *,
     mode: str = "dedicated",

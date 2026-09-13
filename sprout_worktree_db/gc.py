@@ -6,10 +6,10 @@ import json
 import os
 import shutil
 
+from sprout_worktree_db.drop import execute_drop_lease
 from sprout_worktree_db.gitutil import git_worktree_paths, run
-from sprout_worktree_db.models import DropOp, PluginConfig, PluginState, SlugLease
+from sprout_worktree_db.models import DropOp, PluginConfig, PluginState, Secrets, SlugLease
 from sprout_worktree_db.paths import log, require_admin_url
-from sprout_worktree_db.provision import execute_drop_lease
 from sprout_worktree_db.state import (
     expired_lease_keys,
     key_from_object,
@@ -131,7 +131,7 @@ def plan_orphans(
     return plans
 
 
-def list_postgres_worktree_dbs(secrets: dict[str, str]) -> list[str] | None:
+def list_postgres_worktree_dbs(secrets: Secrets) -> list[str] | None:
     """List sprout_wt_* databases via psql if available."""
     admin_url = secrets.get("SPROUT_WORKTREE_ADMIN_URL", "").strip()
     if not admin_url:
@@ -186,7 +186,7 @@ def reserve_orphan_leases(
 
 def apply_drop_leases(
     cfg: PluginConfig,
-    secrets: dict,
+    secrets: Secrets,
     reserved: list[tuple[DropOp, SlugLease]],
 ) -> list[str]:
     """Execute reserved drop leases; return object names that were dropped."""
@@ -203,7 +203,7 @@ def apply_drop_leases(
 
 def gc(
     cfg: PluginConfig,
-    secrets: dict,
+    secrets: Secrets,
     dry_run: bool = False,
     *,
     reclaim_leases: bool = False,

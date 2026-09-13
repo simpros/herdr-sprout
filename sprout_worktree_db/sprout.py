@@ -11,7 +11,12 @@ from pathlib import Path
 
 from sprout_worktree_db.envfile import read_env_values
 from sprout_worktree_db.gitutil import branch_of, run
-from sprout_worktree_db.models import EnvInjection, PluginConfig, RepoConfig
+from sprout_worktree_db.models import (
+    EnvInjection,
+    PluginConfig,
+    RepoConfig,
+    Secrets,
+)
 from sprout_worktree_db.paths import clean_env, log, require_admin_url
 
 
@@ -29,7 +34,7 @@ def resolve_sprout_cli(cfg: PluginConfig) -> str:
 
 
 def sprout_cli(
-    cfg: PluginConfig, secrets: dict, args: list[str]
+    cfg: PluginConfig, secrets: Secrets, args: list[str]
 ) -> tuple[int, str, str]:
     cmd = [resolve_sprout_cli(cfg), *args]
     env = clean_env(
@@ -58,7 +63,7 @@ def track_keys_for(repo: RepoConfig) -> set[str]:
 
 def provision_dedicated(
     cfg: PluginConfig,
-    secrets: dict,
+    secrets: Secrets,
     repo: RepoConfig,
     worktree: str,
     key: str,
@@ -110,7 +115,7 @@ def provision_dedicated(
 
 
 def attach_preview(
-    cfg: PluginConfig, secrets: dict, repo: RepoConfig, worktree: str
+    cfg: PluginConfig, secrets: Secrets, repo: RepoConfig, worktree: str
 ) -> EnvInjection:
     """Point the worktree at the PR preview's database instead of a fresh one."""
     branch = branch_of(worktree)
@@ -227,7 +232,7 @@ def resolve_pr(repo: RepoConfig, branch: str) -> int | None:
     return int(data[0]["number"]) if data else None
 
 
-def drop_key(cfg: PluginConfig, secrets: dict, key: str) -> None:
+def drop_key(cfg: PluginConfig, secrets: Secrets, key: str) -> None:
     rc, out, err = sprout_cli(
         cfg,
         secrets,
