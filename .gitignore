@@ -1,0 +1,11 @@
+# Local / editor noise
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Never commit live secrets or runtime state
+secrets.env
+config.json
+*.log
