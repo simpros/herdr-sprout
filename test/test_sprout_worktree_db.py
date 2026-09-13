@@ -15,10 +15,13 @@ from unittest import mock
 from _helpers import ROOT, SCRIPT, repo
 
 from sprout_worktree_db import envfile, state  # noqa: E402
+from sprout_worktree_db.errors import PluginError  # noqa: E402
 from sprout_worktree_db.models import (  # noqa: E402
     PluginConfig,
     PluginState,
     RepoConfig,
+    StepResult,
+    StepSpec,
     WorktreeRecord,
 )
 from sprout_worktree_db.keys import (  # noqa: E402
@@ -151,7 +154,7 @@ class MintKeyTest(unittest.TestCase):
                     )
                 }
             )
-            with self.assertRaises(SystemExit) as ctx:
+            with self.assertRaises(PluginError) as ctx:
                 resolve_key(st, wt, repo("myapp"), requested="forced")
             self.assertIn("already claimed", str(ctx.exception))
 
@@ -166,32 +169,39 @@ class MintKeyTest(unittest.TestCase):
 
 class StepsSkipTest(unittest.TestCase):
     def test_missing_node_modules_is_not_ok(self):
+        spec = StepSpec(cmd=("echo", "hi"))
         results = steps_mod.run_steps(
             PluginConfig(repos=(repo(requires_node_modules=True, steps=(
-                {"cmd": ["echo", "hi"]},
+                spec,
             )),)),
             {"SPROUT_WORKTREE_ADMIN_URL": "postgres://u:p@h/db"},
-            repo(requires_node_modules=True, steps=({"cmd": ["echo", "hi"]},)),
+            repo(requires_node_modules=True, steps=(spec,)),
             "/tmp/nonexistent-worktree-xyz",
         )
         self.assertEqual(len(results), 1)
-        self.assertFalse(results[0]["ok"])
-        self.assertIn("skipped", results[0])
+        self.assertFalse(results[0].ok)
+        self.assertIsNotNone(results[0].skipped)
         self.assertEqual(steps_mod.steps_status(results), "skipped")
 
     def test_steps_status_ternary(self):
         self.assertIsNone(steps_mod.steps_status([]))
         self.assertEqual(
-            steps_mod.steps_status([{"ok": True}]),
+            steps_mod.steps_status([StepResult(step="x", ok=True)]),
             "ok",
         )
         self.assertEqual(
-            steps_mod.steps_status([{"ok": False, "error": "boom"}]),
+            steps_mod.steps_status(
+                [StepResult(step="x", ok=False, error="boom")]
+            ),
             "failed",
         )
         self.assertEqual(
             steps_mod.steps_status(
-                [{"ok": False, "skipped": "node_modules missing"}]
+                [
+                    StepResult(
+                        step="x", ok=False, skipped="node_modules missing"
+                    )
+                ]
             ),
             "skipped",
         )
@@ -199,20 +209,20 @@ class StepsSkipTest(unittest.TestCase):
 
 class PluginConfigTest(unittest.TestCase):
     def test_requires_env_files(self):
-        with self.assertRaises(SystemExit) as ctx:
+        with self.assertRaises(PluginError) as ctx:
             RepoConfig.from_dict(
                 {"name": "x", "main_repo": "/r", "env_files": []}
             )
         self.assertIn("env_files", str(ctx.exception))
 
     def test_requires_name_and_main(self):
-        with self.assertRaises(SystemExit):
+        with self.assertRaises(PluginError):
             RepoConfig.from_dict({"main_repo": "/r", "env_files": [".env"]})
-        with self.assertRaises(SystemExit):
+        with self.assertRaises(PluginError):
             RepoConfig.from_dict({"name": "x", "env_files": [".env"]})
 
     def test_corrupt_state_rejected(self):
-        with self.assertRaises(SystemExit) as ctx:
+        with self.assertRaises(PluginError) as ctx:
             PluginState.from_dict(
                 {"worktrees": {"/wt": {"object": "sprout_wt_x"}}}
             )
@@ -224,12 +234,12 @@ class PluginConfigTest(unittest.TestCase):
             try:
                 path = Path(tmp) / "state.json"
                 path.write_text("{")
-                with self.assertRaises(SystemExit) as ctx:
+                with self.assertRaises(PluginError) as ctx:
                     state.load_state()
                 self.assertIn("corrupt state.json", str(ctx.exception))
                 # File must be unchanged (no empty wipe via locked_state).
                 self.assertEqual(path.read_text(), "{")
-                with self.assertRaises(SystemExit):
+                with self.assertRaises(PluginError):
                     with state.locked_state():
                         pass
                 self.assertEqual(path.read_text(), "{")
@@ -242,7 +252,7 @@ class PluginConfigTest(unittest.TestCase):
             try:
                 path = Path(tmp) / "state.json"
                 path.write_text("[1,2,3]\n")
-                with self.assertRaises(SystemExit) as ctx:
+                with self.assertRaises(PluginError) as ctx:
                     state.load_state()
                 self.assertIn("root must be an object", str(ctx.exception))
             finally:
@@ -388,7 +398,7 @@ class PackageLayoutTest(unittest.TestCase):
                 "sprout_worktree_db.sprout.sprout_cli",
                 return_value=(0, json.dumps(previews), ""),
             ):
-                with self.assertRaises(SystemExit) as ctx:
+                with self.assertRaises(PluginError) as ctx:
                     attach_preview(
                         cfg,
                         {"SPROUT_PREVIEW_OWNER_URL": "postgres://u:p@h/db"},

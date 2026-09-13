@@ -13,6 +13,7 @@ from unittest import mock
 from _helpers import ROOT, repo  # noqa: F401 — ROOT ensures sys.path
 
 from sprout_worktree_db import state
+from sprout_worktree_db.errors import PluginError, SproutError
 from sprout_worktree_db.keys import mint_key, object_name
 from sprout_worktree_db.leases import (
     abort_drop,
@@ -31,7 +32,7 @@ from sprout_worktree_db.models import (
 class DropLeaseTest(unittest.TestCase):
     def test_fail_closed_without_state_or_repo(self):
         cfg = PluginConfig(repos=())
-        with self.assertRaises(SystemExit) as ctx:
+        with self.assertRaises(PluginError) as ctx:
             begin_drop(cfg, "/tmp/ghost-wt", requested=None)
         self.assertIn("--key", str(ctx.exception))
 
@@ -148,12 +149,12 @@ class DropLeaseTest(unittest.TestCase):
                 )
                 self.assertEqual(lease.worktrees, (wt,))
                 # Concurrent provision must fail closed while lease is held.
-                with self.assertRaises(SystemExit) as ctx:
+                with self.assertRaises(PluginError) as ctx:
                     with claim_provision(wt, repo("app"), mode="dedicated"):
                         pass
                 self.assertIn("in progress", str(ctx.exception))
                 # Second begin_drop must not mint another lease for the same slug.
-                with self.assertRaises(SystemExit) as ctx2:
+                with self.assertRaises(PluginError) as ctx2:
                     begin_drop(cfg, wt)
                 self.assertIn("in progress", str(ctx2.exception))
                 finish_drop(lease)
@@ -303,7 +304,7 @@ class DropLeaseTest(unittest.TestCase):
                 )
                 state.save_state(st)
                 cfg = PluginConfig(repos=(repo("app"),))
-                with self.assertRaises(SystemExit):
+                with self.assertRaises(PluginError):
                     begin_drop(cfg, wt)
                 lease = begin_drop(cfg, wt, force=True)
                 self.assertEqual(lease.lease_id, 2)
@@ -345,7 +346,7 @@ class DropLeaseTest(unittest.TestCase):
                 )
                 state.save_state(st)
                 cfg = PluginConfig(repos=(repo("app"),))
-                with self.assertRaises(SystemExit) as ctx:
+                with self.assertRaises(PluginError) as ctx:
                     begin_drop(cfg, wt, force=True)
                 self.assertIn("provision in progress", str(ctx.exception))
                 self.assertIn(key, state.load_state().leases)
@@ -382,7 +383,7 @@ class DropLeaseTest(unittest.TestCase):
                     "sprout_worktree_db.leases.repo_config",
                     return_value=repo("myapp"),
                 ):
-                    with self.assertRaises(SystemExit) as ctx:
+                    with self.assertRaises(PluginError) as ctx:
                         begin_drop(cfg, wt)
                     self.assertIn("in progress", str(ctx.exception))
                     lease = begin_drop(cfg, wt, force=True)
@@ -435,8 +436,8 @@ class DropLeaseTest(unittest.TestCase):
             finally:
                 del os.environ["HERDR_PLUGIN_STATE_DIR"]
 
-    def test_fast_path_git_also_outside_lock(self):
-        """Row present: remint unused, but any git still stays out of the lock."""
+    def test_fast_path_skips_git_when_row_present(self):
+        """Row present: remint is recovery-only, so no git runs at all."""
         import sprout_worktree_db.leases as leases_mod
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -483,13 +484,78 @@ class DropLeaseTest(unittest.TestCase):
                     lease = begin_drop(cfg, wt)
                 # Resolved key comes from the row, not the remint.
                 self.assertEqual(lease.key, "app-feature-abc12")
-                if "repo_config" in calls:
-                    self.assertLess(
-                        calls.index("repo_config"),
-                        calls.index("lock-enter"),
-                        f"git must precede the lock: {calls}",
-                    )
+                # Recovery-only remint: the fast path never shells git.
+                self.assertNotIn(
+                    "repo_config", calls, f"git must not run: {calls}"
+                )
                 abort_drop(lease)
+            finally:
+                del os.environ["HERDR_PLUGIN_STATE_DIR"]
+
+
+class ExecuteDropLeaseAbortTest(unittest.TestCase):
+    """SproutError must abort the lease — never leave it stuck.
+
+    Regression for PluginError(SystemExit) punching through the
+    ``except Exception`` net in ``execute_drop_lease``.
+    """
+
+    def _setup(self, tmp: str):
+        from sprout_worktree_db.drop import execute_drop_lease
+
+        os.environ["HERDR_PLUGIN_STATE_DIR"] = tmp
+        wt = str(Path(tmp) / "feature")
+        Path(wt).mkdir()
+        st = PluginState(
+            worktrees={
+                wt: WorktreeRecord(
+                    key="app-feature-abc12",
+                    repo="app",
+                    mode="dedicated",
+                    object="sprout_wt_app_feature_abc12",
+                    created_at="",
+                )
+            }
+        )
+        state.save_state(st)
+        cfg = PluginConfig(repos=(repo("app"),))
+        return cfg, wt, execute_drop_lease
+
+    def test_sprout_failure_aborts_and_reraises(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, wt, execute_drop_lease = self._setup(tmp)
+            try:
+                lease = begin_drop(cfg, wt)
+                with mock.patch(
+                    "sprout_worktree_db.drop.drop_key",
+                    side_effect=SproutError("boom"),
+                ):
+                    with self.assertRaises(SproutError):
+                        execute_drop_lease(cfg, {}, lease, reraise=True)
+                after = state.load_state()
+                self.assertNotIn(lease.key, after.leases)
+                self.assertIn(wt, after.worktrees)
+            finally:
+                del os.environ["HERDR_PLUGIN_STATE_DIR"]
+
+    def test_sprout_failure_aborts_and_soft_fails(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, wt, execute_drop_lease = self._setup(tmp)
+            try:
+                lease = begin_drop(cfg, wt)
+                with mock.patch(
+                    "sprout_worktree_db.drop.drop_key",
+                    side_effect=SproutError("boom"),
+                ):
+                    ok = execute_drop_lease(cfg, {}, lease, reraise=False)
+                self.assertFalse(ok)
+                after = state.load_state()
+                self.assertNotIn(lease.key, after.leases)
+                self.assertIn(wt, after.worktrees)
             finally:
                 del os.environ["HERDR_PLUGIN_STATE_DIR"]
 

@@ -31,6 +31,9 @@ def execute_drop_lease(
         finish_drop(lease)
         return True
     except Exception as exc:
+        # Broad on purpose: PluginError subclasses Exception (never
+        # SystemExit) so every expected sprout failure lands here and
+        # aborts the lease instead of leaving it stuck.
         abort_drop(lease)
         if reraise:
             raise

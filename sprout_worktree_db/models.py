@@ -16,8 +16,99 @@ LeaseOp = Literal["provision", "drop"]
 
 # Secrets flow end-to-end as string mappings (parsed once in paths.py).
 Secrets = Mapping[str, str]
-# Step rows are small JSON-ish dicts (cmd / ok / error / skipped / seconds).
-StepRecord = dict[str, object]
+
+
+@dataclass(frozen=True)
+class StepSpec:
+    """One configured post-provision step (parsed once in ``RepoConfig``).
+
+    ``cmd`` is the full argv (``{bun}`` is expanded to the bun binary at
+    run time). ``as_admin`` re-issues owner credentials via ``admin_env``
+    overrides; the runner reads these fields directly — no ``.get`` soup.
+    """
+
+    cmd: tuple[str, ...]
+    as_admin: bool = False
+    admin_env: dict[str, str] = field(default_factory=dict)
+
+    @classmethod
+    def from_raw(cls, raw: object, repo_name: str) -> StepSpec:
+        if isinstance(raw, list):
+            parts = raw
+            as_admin = False
+            admin_env: dict[str, str] = {}
+        elif isinstance(raw, dict) and "cmd" in raw:
+            parts = raw["cmd"]
+            as_admin = bool(raw.get("as_admin"))
+            extra = raw.get("admin_env") or {}
+            if not isinstance(extra, dict):
+                raise ConfigError(
+                    f"repos[] entry {repo_name!r}: "
+                    "'admin_env' must be an object"
+                )
+            admin_env = {str(k): str(v) for k, v in extra.items()}
+        else:
+            raise ConfigError(
+                f"repos[] entry {repo_name!r}: each step needs 'cmd'"
+            )
+        if not isinstance(parts, list) or not parts:
+            raise ConfigError(
+                f"repos[] entry {repo_name!r}: each step needs 'cmd'"
+            )
+        return cls(
+            cmd=tuple(str(p) for p in parts),
+            as_admin=as_admin,
+            admin_env=admin_env,
+        )
+
+
+@dataclass(frozen=True)
+class StepResult:
+    """One executed step row (persisted on the claim, shown in status).
+
+    ``step`` is the joined command (``"all"`` for the node_modules skip).
+    Exactly one of ``error`` / ``skipped`` is set on non-ok rows.
+    """
+
+    step: str
+    ok: bool
+    seconds: float | None = None
+    error: str | None = None
+    skipped: str | None = None
+
+    def to_dict(self) -> dict:
+        data: dict = {"step": self.step, "ok": self.ok}
+        if self.seconds is not None:
+            data["seconds"] = self.seconds
+        if self.error is not None:
+            data["error"] = self.error
+        if self.skipped is not None:
+            data["skipped"] = self.skipped
+        return data
+
+    @classmethod
+    def from_dict(cls, data: dict) -> StepResult:
+        if not isinstance(data, dict):
+            raise CorruptStateError(
+                "corrupt state.json: step rows must be objects"
+            )
+        return cls(
+            step=str(data.get("step", "")),
+            ok=bool(data.get("ok")),
+            seconds=(
+                float(data["seconds"])
+                if data.get("seconds") is not None
+                else None
+            ),
+            error=(
+                str(data["error"]) if data.get("error") is not None else None
+            ),
+            skipped=(
+                str(data["skipped"])
+                if data.get("skipped") is not None
+                else None
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -46,7 +137,7 @@ class RepoConfig:
     main_repo: str
     env_files: tuple[str, ...]
     renames: dict[str, str] = field(default_factory=dict)
-    steps: tuple[StepRecord, ...] = field(default_factory=tuple)
+    steps: tuple[StepSpec, ...] = field(default_factory=tuple)
     requires_node_modules: bool = False
     worktrees_root: str | None = None
     canonical_repo_id: str | None = None
@@ -84,16 +175,9 @@ class RepoConfig:
             raise ConfigError(
                 f"repos[] entry {name!r}: 'steps' must be an array"
             )
-        steps: list[StepRecord] = []
+        steps: list[StepSpec] = []
         for raw in raw_steps:
-            if isinstance(raw, list):
-                steps.append({"cmd": raw})
-            elif isinstance(raw, dict) and "cmd" in raw:
-                steps.append(dict(raw))
-            else:
-                raise ConfigError(
-                    f"repos[] entry {name!r}: each step needs 'cmd'"
-                )
+            steps.append(StepSpec.from_raw(raw, name))
         forge = str(data.get("forge") or "gitlab")
         return cls(
             name=name,
@@ -153,7 +237,7 @@ class WorktreeRecord:
     object: str
     created_at: str
     env_files: list[str] = field(default_factory=list)
-    steps: list[StepRecord] = field(default_factory=list)
+    steps: list[StepResult] = field(default_factory=list)
     pr_id: int | None = None
     preview_url: str | None = None
 
@@ -165,7 +249,10 @@ class WorktreeRecord:
             "object": self.object,
             "created_at": self.created_at,
             "env_files": list(self.env_files),
-            "steps": list(self.steps),
+            "steps": [
+                s.to_dict() if isinstance(s, StepResult) else dict(s)
+                for s in self.steps
+            ],
         }
         if self.pr_id is not None:
             data["pr_id"] = self.pr_id
@@ -176,6 +263,12 @@ class WorktreeRecord:
     @classmethod
     def from_dict(cls, data: dict) -> WorktreeRecord:
         # Legacy "status" field is ignored — derived from lease membership.
+        raw_steps = data.get("steps") or []
+        steps = [
+            s if isinstance(s, StepResult)
+            else StepResult.from_dict(s if isinstance(s, dict) else {})
+            for s in raw_steps
+        ]
         return cls(
             key=str(data["key"]),
             repo=str(data.get("repo", "")),
@@ -183,7 +276,7 @@ class WorktreeRecord:
             object=str(data.get("object", "")),
             created_at=str(data.get("created_at", "")),
             env_files=list(data.get("env_files") or []),
-            steps=list(data.get("steps") or []),
+            steps=steps,
             pr_id=data.get("pr_id"),
             preview_url=data.get("preview_url"),
         )

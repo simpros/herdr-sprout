@@ -1,21 +1,22 @@
-"""Domain error hierarchy (typed alternative to bare ``SystemExit``).
+"""Domain error hierarchy (typed alternative to interpreter abort).
 
 Every expected failure in this package — bad config, lease contention,
 corrupt state — raises a :class:`PluginError` subclass instead of a bare
-``SystemExit`` so callers can distinguish domain errors from an
-interpreter abort (``except PluginError`` vs ``except SystemExit``).
+``SystemExit`` or ``RuntimeError`` so callers can distinguish domain errors
+from an interpreter abort (``except PluginError`` vs ``except SystemExit``).
 
-``PluginError`` subclasses ``SystemExit`` on purpose: a ``PluginError("msg")``
-still exits 1 with the message on stderr when it propagates out of the CLI,
-and existing ``except SystemExit`` handling keeps working. New code should
-catch ``PluginError`` (or a subclass) explicitly.
+``PluginError`` subclasses ``Exception`` on purpose: the shared drop
+executor aborts leases under ``except Exception``, and a ``SystemExit``
+base would punch through that net and leave exclusive leases stuck.
+``cli.main`` / ``hook`` map ``PluginError`` explicitly to exit codes —
+that mapping is the real error boundary.
 """
 
 from __future__ import annotations
 
 
-class PluginError(SystemExit):
-    """Base for all expected domain failures (exit 1 with a message)."""
+class PluginError(Exception):
+    """Base for all expected domain failures (CLI maps to exit 1)."""
 
 
 class BusyError(PluginError):

@@ -12,6 +12,7 @@ from unittest import mock
 from _helpers import ROOT, repo  # noqa: F401 — ROOT ensures sys.path
 
 from sprout_worktree_db import state
+from sprout_worktree_db.errors import PluginError
 from sprout_worktree_db.keys import object_name
 from sprout_worktree_db.leases import (
     ProvisionLease,
@@ -25,6 +26,7 @@ from sprout_worktree_db.models import (
     PluginState,
     ProvisionRequest,
     SlugLease,
+    StepResult,
     WorktreeRecord,
 )
 from sprout_worktree_db.provision import do_provision
@@ -47,7 +49,7 @@ class ProvisionLeaseTest(unittest.TestCase):
                     self.assertEqual(mid.leases[key].op, "provision")
                     self.assertEqual(mid.leases[key].worktrees, (wt,))
                     cfg = PluginConfig(repos=(repo("app"),))
-                    with self.assertRaises(SystemExit) as ctx:
+                    with self.assertRaises(PluginError) as ctx:
                         begin_drop(cfg, wt)
                     self.assertIn("provision in progress", str(ctx.exception))
                 # Session exit always releases the lease (abort ≡ release).
@@ -109,7 +111,7 @@ class ProvisionLeaseTest(unittest.TestCase):
                 stale = ProvisionLease(
                     worktree=wt, key="app-feature-abc12", lease_id=99
                 )
-                with self.assertRaises(SystemExit) as ctx:
+                with self.assertRaises(PluginError) as ctx:
                     stale.finalize(
                         WorktreeRecord(
                             key="app-feature-abc12",
@@ -143,7 +145,7 @@ class ProvisionLeaseTest(unittest.TestCase):
                     }
                 )
                 state.save_state(st)
-                with self.assertRaises(SystemExit) as ctx:
+                with self.assertRaises(PluginError) as ctx:
                     with claim_provision(
                         b,
                         repo("app"),
@@ -174,7 +176,7 @@ class ProvisionLeaseTest(unittest.TestCase):
                     }
                 )
                 state.save_state(st)
-                with self.assertRaises(SystemExit) as ctx:
+                with self.assertRaises(PluginError) as ctx:
                     with claim_provision(wt, repo("app"), mode="preview"):
                         pass
                 self.assertIn("drop first", str(ctx.exception))
@@ -244,11 +246,11 @@ class ProvisionLeaseTest(unittest.TestCase):
                         "provisioning",
                     )
                     cfg = PluginConfig(repos=(repo("app"),))
-                    with self.assertRaises(SystemExit) as ctx:
+                    with self.assertRaises(PluginError) as ctx:
                         begin_drop(cfg, wt)
                     self.assertIn("provision in progress", str(ctx.exception))
 
-                    steps = [{"ok": True, "cmd": "migrate"}]
+                    steps = [StepResult(step="migrate", ok=True)]
                     lease.record_steps(steps)
                     self.assertEqual(
                         state.load_state().worktrees[wt].steps, steps
@@ -290,7 +292,7 @@ class ProvisionLeaseTest(unittest.TestCase):
                     stale = ProvisionLease(
                         worktree=wt, key=key, lease_id=lease.lease_id + 1
                     )
-                    stale.record_steps([{"ok": True}])
+                    stale.record_steps([StepResult(step="x", ok=True)])
                     self.assertEqual(state.load_state().worktrees[wt].steps, [])
             finally:
                 del os.environ["HERDR_PLUGIN_STATE_DIR"]
@@ -373,7 +375,7 @@ class ProvisionOrphanCleanupTest(unittest.TestCase):
                         side_effect=SproutError("lease lost"),
                     ),
                 ):
-                    with self.assertRaises(SystemExit):
+                    with self.assertRaises(PluginError):
                         do_provision(
                             cfg,
                             {},
@@ -399,7 +401,7 @@ class ProvisionOrphanCleanupTest(unittest.TestCase):
                     "sprout_worktree_db.provision.provision_dedicated",
                     side_effect=SproutError("sprout boom"),
                 ):
-                    with self.assertRaises(SystemExit):
+                    with self.assertRaises(PluginError):
                         do_provision(
                             cfg,
                             {},

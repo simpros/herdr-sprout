@@ -28,16 +28,18 @@ from sprout_worktree_db.keys import (
 )
 from sprout_worktree_db.models import (
     DropOp,
+    LeaseOp,
     Mode,
     PluginConfig,
     PluginState,
     RepoConfig,
     SlugLease,
-    StepRecord,
+    StepResult,
     WorktreeRecord,
 )
 from sprout_worktree_db.paths import log
 from sprout_worktree_db.state import (
+    load_state,
     locked_state,
     path_for_key,
     reclaim_expired_leases,
@@ -60,44 +62,29 @@ def _forget_set(
     return tuple(dict.fromkeys(p for p in (claim, *extra) if p))
 
 
-def _mint_provision_lease(
+def _mint_lease(
     state: PluginState,
     key: str,
     *,
+    op: LeaseOp,
     worktrees: tuple[str, ...],
+    object_name: str = "",
+    touch_postgres: bool = False,
 ) -> SlugLease:
-    """Mint a provision lease (no forget-set: the claim row is the set)."""
+    """Single lease constructor — one id sequence, no op switchboard.
+
+    Provision callers pass the in-flight worktree directly (the claim row
+    is the forget-set, so no expansion). Drop callers pre-expand via
+    :func:`_forget_set` and pass the baked ``object_name`` /
+    ``touch_postgres``.
+    """
     lease_id = state.next_lease_id
     state.next_lease_id = lease_id + 1
     lease = SlugLease(
         lease_id=lease_id,
         key=key,
-        op="provision",
+        op=op,
         worktrees=worktrees,
-        object_name="",
-        touch_postgres=False,
-        reserved_at=_now_iso(),
-    )
-    state.leases[key] = lease
-    return lease
-
-
-def _mint_drop_lease(
-    state: PluginState,
-    key: str,
-    *,
-    worktrees: tuple[str, ...],
-    object_name: str,
-    touch_postgres: bool,
-) -> SlugLease:
-    """Mint a drop lease (drop-only forget-set: claim path + remint extras)."""
-    lease_id = state.next_lease_id
-    state.next_lease_id = lease_id + 1
-    lease = SlugLease(
-        lease_id=lease_id,
-        key=key,
-        op="drop",
-        worktrees=_forget_set(state, key, worktrees),
         object_name=object_name,
         touch_postgres=touch_postgres,
         reserved_at=_now_iso(),
@@ -142,22 +129,16 @@ def _claim_key(
         key = resolve_key(state, worktree, repo, requested)
         if key in state.leases:
             raise BusyError(_busy_msg(key, state.leases[key]))
-        holder = next(
-            (
-                p
-                for p, r in state.worktrees.items()
-                if r.key == key and p != worktree
-            ),
-            None,
-        )
-        if holder:
+        holder = path_for_key(state, key)
+        if holder is not None and holder != worktree:
             raise BusyError(
                 f"key {key!r} already claimed by {holder}; "
                 "drop that worktree first"
             )
-        lease = _mint_provision_lease(
+        lease = _mint_lease(
             state,
             key,
+            op="provision",
             worktrees=(worktree,),
         )
         return key, lease.lease_id
@@ -203,15 +184,8 @@ def _finalize_claim(
                 f"key claim lost for {worktree}: held {existing.key!r}, "
                 f"provisioned {key!r}"
             )
-        holder = next(
-            (
-                p
-                for p, r in state.worktrees.items()
-                if r.key == key and p != worktree
-            ),
-            None,
-        )
-        if holder:
+        holder = path_for_key(state, key)
+        if holder is not None and holder != worktree:
             raise SproutError(
                 f"key {key!r} already claimed by {holder}; "
                 "drop that worktree first"
@@ -256,7 +230,7 @@ class ProvisionLease:
     def finalize(self, record: WorktreeRecord) -> None:
         _finalize_claim(self.worktree, self.key, self.lease_id, record)
 
-    def record_steps(self, steps: list[StepRecord]) -> None:
+    def record_steps(self, steps: list[StepResult]) -> None:
         _update_claim_steps(self.worktree, self.key, self.lease_id, steps)
 
     def release(self) -> None:
@@ -286,7 +260,7 @@ def claim_provision(
 
 
 def _update_claim_steps(
-    worktree: str, key: str, lease_id: int, steps: list[StepRecord]
+    worktree: str, key: str, lease_id: int, steps: list[StepResult]
 ) -> None:
     """Persist step results while this provision lease still owns the slug.
 
@@ -324,10 +298,11 @@ def _reserve(
         stolen = state.leases.pop(key, None)
         if stolen:
             log(f"stole drop lease for {key!r}")
-    return _mint_drop_lease(
+    return _mint_lease(
         state,
         key,
-        worktrees=worktrees,
+        op="drop",
+        worktrees=_forget_set(state, key, worktrees),
         object_name=object_name,
         touch_postgres=touch_postgres,
     )
@@ -440,6 +415,11 @@ def begin_drop(
     exclusive state flock (a hung git would stall every other writer).
     ``_drop_target`` under the lock is then a pure state lookup; a row
     created concurrently still wins because the lock re-checks state.
+
+    Remint is recovery-only: when a state row already owns the worktree,
+    no git runs at all (checked lock-free first). The concurrent-create
+    race (row appears after the check) only wastes one git call — the
+    lock still prefers the row and ignores the unused remint.
     """
     wt = os.path.realpath(worktree) if worktree else None
     requested_key: str | None = None
@@ -451,9 +431,13 @@ def begin_drop(
         raise ConfigError("drop needs --worktree or --key")
     remint_key: str | None = None
     if wt is not None and requested_key is None:
-        repo = repo_config(cfg, wt)
-        if repo is not None:
-            remint_key = mint_key(wt, repo)
+        # Fast path: a tracked row needs no remint — skip git entirely.
+        # Lock-free read only; the lock below re-checks state, so a
+        # concurrently created row still wins (remint goes unused).
+        if load_state().worktrees.get(wt) is None:
+            repo = repo_config(cfg, wt)
+            if repo is not None:
+                remint_key = mint_key(wt, repo)
     with locked_state() as state:
         for key in reclaim_expired_leases(state):
             log(f"reclaimed expired lease for {key!r}")

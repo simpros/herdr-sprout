@@ -41,7 +41,7 @@ def _modern_lease(**overrides):
 class StateSchemaTest(unittest.TestCase):
     def test_duplicate_key_rejected_on_load(self):
         """One key → one path: corrupt multi-path state fails closed."""
-        with self.assertRaises(SystemExit) as ctx:
+        with self.assertRaises(CorruptStateError) as ctx:
             PluginState.from_dict(
                 {
                     "worktrees": {
@@ -103,7 +103,7 @@ class StateSchemaTest(unittest.TestCase):
         self.assertIn("touch_postgres", str(ctx.exception))
 
     def test_modern_missing_touch_is_corrupt(self):
-        with self.assertRaises(SystemExit):
+        with self.assertRaises(CorruptStateError):
             PluginState.from_dict(
                 {
                     "worktrees": {},
@@ -162,11 +162,11 @@ class StateSchemaTest(unittest.TestCase):
                     next_lease_id=2,
                 )
                 state.save_state(st)
-                with self.assertRaises(SystemExit):
+                with self.assertRaises(BusyError):
                     with state.locked_state() as locked:
                         cleared = state.reclaim_expired_leases(locked)
                         self.assertIn(key, cleared)
-                        raise SystemExit("busy: drop in progress")
+                        raise BusyError("busy: drop in progress")
                 self.assertNotIn(key, state.load_state().leases)
             finally:
                 del os.environ["HERDR_PLUGIN_STATE_DIR"]
@@ -238,12 +238,26 @@ class StateSchemaTest(unittest.TestCase):
 
 
 class ErrorHierarchyTest(unittest.TestCase):
-    def test_domain_errors_stay_system_exit_compatible(self):
-        """PluginError subclasses SystemExit: old catches keep working."""
+    def test_domain_errors_are_plain_exceptions(self):
+        """PluginError subclasses Exception — never SystemExit.
+
+        The shared drop executor aborts leases under ``except Exception``;
+        a SystemExit base punched through that net and left exclusive
+        leases stuck on the happy failure path.
+        """
+        self.assertTrue(issubclass(PluginError, Exception))
+        self.assertFalse(issubclass(PluginError, SystemExit))
         for cls in (BusyError, ConfigError, CorruptStateError, SproutError):
             self.assertTrue(issubclass(cls, PluginError))
-            with self.assertRaises(SystemExit):
+            with self.assertRaises(PluginError):
                 raise cls("boom")
+            # Caught by a plain `except Exception` (the drop-abort net).
+            try:
+                raise cls("boom")
+            except Exception:
+                pass
+            else:
+                self.fail(f"{cls.__name__} escaped except Exception")
 
     def test_domain_errors_distinguishable_from_interpreter_abort(self):
         with self.assertRaises(PluginError):
@@ -261,7 +275,7 @@ class ErrorHierarchyTest(unittest.TestCase):
     def test_busy_message_preserved(self):
         try:
             raise BusyError("key 'x': drop in progress")
-        except SystemExit as exc:
+        except PluginError as exc:
             self.assertIn("in progress", str(exc))
 
 
