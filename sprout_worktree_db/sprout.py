@@ -10,6 +10,7 @@ import urllib.parse
 from pathlib import Path
 
 from sprout_worktree_db.envfile import read_env_values
+from sprout_worktree_db.errors import ConfigError
 from sprout_worktree_db.gitutil import branch_of, run
 from sprout_worktree_db.models import (
     EnvInjection,
@@ -27,7 +28,7 @@ def resolve_sprout_cli(cfg: PluginConfig) -> str:
     found = shutil.which("sprout")
     if found:
         return found
-    raise SystemExit(
+    raise ConfigError(
         "sprout CLI not found (set config.cli or install sprout on PATH; "
         "glibc hosts may need a source build — see README)"
     )

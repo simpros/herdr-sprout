@@ -16,6 +16,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Iterator
 
+from sprout_worktree_db.errors import CorruptStateError
 from sprout_worktree_db.models import (
     PluginState,
     SlugLease,
@@ -31,13 +32,11 @@ LEASE_TTL_SECONDS = 3600
 def _read_state_file() -> PluginState:
     """Read-only parse of state.json (never persists).
 
-    Legacy shapes are normalized in memory by
-    :func:`models.normalize_state_dict`; the canonical form is persisted
-    lazily by the next :func:`locked_state` mutation — never from this
-    lock-free read path, so concurrent status/GC readers cannot tear
-    the write. Legacy *path* migration (``~/.config/sprout/...`` → herdr
-    state dir) happens once in :func:`paths.state_path`, shared with
-    config/secrets.
+    The schema is canonical-only (see :meth:`models.PluginState.from_dict`):
+    pre-0.1.0 shapes fail closed here, and this lock-free path never writes,
+    so concurrent status/GC readers cannot tear the file. Legacy *path*
+    migration (``~/.config/sprout/...`` → herdr state dir) happens once in
+    :func:`paths.state_path`, shared with config/secrets.
     """
     path = state_path()
     if not path.exists():
@@ -45,16 +44,16 @@ def _read_state_file() -> PluginState:
     try:
         text = path.read_text()
     except OSError as exc:
-        raise SystemExit(f"cannot read state.json: {exc}") from exc
+        raise CorruptStateError(f"cannot read state.json: {exc}") from exc
     try:
         data = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise SystemExit(
+        raise CorruptStateError(
             f"corrupt state.json: invalid JSON ({exc}); "
             "fix or remove the file — refusing to wipe claims"
         ) from exc
     if not isinstance(data, dict):
-        raise SystemExit(
+        raise CorruptStateError(
             "corrupt state.json: root must be an object; "
             "refusing to wipe claims"
         )
@@ -80,12 +79,10 @@ def save_state(state: PluginState) -> None:
 def locked_state() -> Iterator[PluginState]:
     """Exclusive lock around load → mutate → save of state.json.
 
-    The exit save also persists any in-memory legacy normalization in
-    canonical form, so unlocked readers stay read-only. The save runs
-    even when the critical section refuses (``SystemExit`` /
-    ``RuntimeError``): reclaim and other in-lock mutations are
-    abort-equivalent, and a refused op must not roll back prior reclaim
-    — the exclusive flock already serializes writers.
+    The exit save runs even when the critical section refuses
+    (``PluginError`` / ``RuntimeError``): reclaim and other in-lock
+    mutations are abort-equivalent, and a refused op must not roll back
+    prior reclaim — the exclusive flock already serializes writers.
     """
     path = state_path()
     path.parent.mkdir(parents=True, exist_ok=True)

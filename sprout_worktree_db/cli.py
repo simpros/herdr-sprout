@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 
+from sprout_worktree_db.errors import ConfigError, PluginError
 from sprout_worktree_db.event import event_worktree_path
 from sprout_worktree_db.gc import gc
 from sprout_worktree_db.gitutil import repo_config
@@ -63,7 +65,7 @@ def status() -> int:
 def hook(event: str) -> int:
     try:
         cfg = load_config()
-    except SystemExit as exc:
+    except PluginError as exc:
         log(f"hook {event}: {exc}")
         return 0
     secrets = load_secrets()
@@ -95,7 +97,7 @@ def hook(event: str) -> int:
                 log(f"hook removed: {path} not tracked, skipping")
                 return 0
             do_drop(cfg, secrets, DropRequest(worktree=path))
-    except SystemExit as exc:
+    except PluginError as exc:
         log(f"hook {event}: {exc}")
         return 1
     except Exception as exc:
@@ -189,13 +191,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.mode == "hook":
         return hook(args.event)
 
-    cfg = load_config()
-    secrets = load_secrets()
+    try:
+        return _dispatch(cfg := load_config(), load_secrets(), args)
+    except PluginError as exc:
+        print(f"sprout-worktree-db: {exc}", file=sys.stderr)
+        return 1
 
+
+def _dispatch(cfg: PluginConfig, secrets: Secrets, args) -> int:
     if args.mode == "action":
         path = event_worktree_path()
         if not path:
-            raise SystemExit(
+            raise ConfigError(
                 "no worktree in HERDR_PLUGIN_CONTEXT_JSON / event payload"
             )
         if args.name == "provision":

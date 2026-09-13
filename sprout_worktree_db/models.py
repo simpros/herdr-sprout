@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
+from sprout_worktree_db.errors import ConfigError, CorruptStateError
+
 
 Mode = Literal["dedicated", "preview"]
 StepsStatus = Literal["ok", "skipped", "failed"]
@@ -53,33 +55,33 @@ class RepoConfig:
     @classmethod
     def from_dict(cls, data: dict) -> RepoConfig:
         if not isinstance(data, dict):
-            raise SystemExit("repos[] entries must be objects")
+            raise ConfigError("repos[] entries must be objects")
         name = str(data.get("name") or "").strip()
         main_repo = str(data.get("main_repo") or "").strip()
         raw_env = data.get("env_files")
         if not name:
-            raise SystemExit("repos[] entry missing required 'name'")
+            raise ConfigError("repos[] entry missing required 'name'")
         if not main_repo:
-            raise SystemExit(
+            raise ConfigError(
                 f"repos[] entry {name!r} missing required 'main_repo'"
             )
         if not isinstance(raw_env, list) or not raw_env:
-            raise SystemExit(
+            raise ConfigError(
                 f"repos[] entry {name!r} requires non-empty 'env_files'"
             )
         env_files = tuple(str(p) for p in raw_env if str(p).strip())
         if not env_files:
-            raise SystemExit(
+            raise ConfigError(
                 f"repos[] entry {name!r} requires non-empty 'env_files'"
             )
         renames = data.get("renames") or {}
         if not isinstance(renames, dict):
-            raise SystemExit(
+            raise ConfigError(
                 f"repos[] entry {name!r}: 'renames' must be an object"
             )
         raw_steps = data.get("steps") or []
         if not isinstance(raw_steps, list):
-            raise SystemExit(
+            raise ConfigError(
                 f"repos[] entry {name!r}: 'steps' must be an array"
             )
         steps: list[StepRecord] = []
@@ -89,7 +91,7 @@ class RepoConfig:
             elif isinstance(raw, dict) and "cmd" in raw:
                 steps.append(dict(raw))
             else:
-                raise SystemExit(
+                raise ConfigError(
                     f"repos[] entry {name!r}: each step needs 'cmd'"
                 )
         forge = str(data.get("forge") or "gitlab")
@@ -126,10 +128,10 @@ class PluginConfig:
     @classmethod
     def from_dict(cls, data: dict) -> PluginConfig:
         if not isinstance(data, dict):
-            raise SystemExit("config.json must be a JSON object")
+            raise ConfigError("config.json must be a JSON object")
         raw_repos = data.get("repos")
         if not isinstance(raw_repos, list) or not raw_repos:
-            raise SystemExit("config.json requires a non-empty 'repos' array")
+            raise ConfigError("config.json requires a non-empty 'repos' array")
         repos = tuple(RepoConfig.from_dict(r) for r in raw_repos)
         cli = data.get("cli")
         bun = data.get("bun")
@@ -189,12 +191,18 @@ class WorktreeRecord:
 
 @dataclass(frozen=True)
 class DropOp:
-    """One drop identity for plan / resolve / reserve / execute.
+    """One drop *plan* for resolve / reserve / execute (not a persisted lease).
 
     ``touch_postgres`` is authoritative: ``--forget-only`` is encoded when the
     op is created (False), not re-OR'd at execute time. ``paths`` is the
     forget-set hint (claim path and/or remint extras); reserve expands via
-    ``path_for_key``.
+    ``path_for_key``. ``reason`` is GC log context only.
+
+    Deliberately distinct from :class:`SlugLease`: plans are pre-lock input
+    (GC builds them lock-free, then reserves under an already-held lock),
+    leases are the persisted exclusive reservation. One call style per op —
+    session CM for provision, begin/finish/abort for drop — because GC's
+    reserve-under-held-lock cannot be served by a session CM.
     """
 
     key: str
@@ -239,37 +247,37 @@ class SlugLease:
 
     @classmethod
     def from_dict(cls, key: str, data: dict) -> SlugLease:
-        """Parse the modern lease object shape (strict).
+        """Parse the canonical lease object shape (strict, no legacy).
 
-        Legacy shapes (string values, ``skip_postgres``, missing ``op``,
-        ``dropping``) are normalized by :func:`normalize_state_dict`
-        before this runs — this constructor stays boring on purpose.
-        ``touch_postgres`` is required; absence is corrupt, not defaulted.
+        Pre-0.1.0 shapes (string values, ``skip_postgres``, missing
+        ``op``, top-level ``dropping``) are corrupt, not migrated — see
+        :meth:`PluginState.from_dict`. ``touch_postgres`` is required;
+        absence is corrupt, not defaulted.
         """
         if not isinstance(data, dict):
-            raise SystemExit(
+            raise CorruptStateError(
                 f"corrupt state.json: leases[{key!r}] must be an object"
             )
         raw_wts = data.get("worktrees") or []
         if not isinstance(raw_wts, list):
-            raise SystemExit(
+            raise CorruptStateError(
                 f"corrupt state.json: leases[{key!r}].worktrees must be a list"
             )
         try:
             lease_id = int(data.get("lease_id", 0))
         except (TypeError, ValueError) as exc:
-            raise SystemExit(
+            raise CorruptStateError(
                 f"corrupt state.json: leases[{key!r}].lease_id invalid"
             ) from exc
         raw_op = data.get("op")
         if raw_op not in ("provision", "drop"):
-            raise SystemExit(
+            raise CorruptStateError(
                 f"corrupt state.json: leases[{key!r}].op must be "
                 "'provision' or 'drop'"
             )
         op: LeaseOp = "provision" if raw_op == "provision" else "drop"
         if "touch_postgres" not in data:
-            raise SystemExit(
+            raise CorruptStateError(
                 f"corrupt state.json: leases[{key!r}] missing "
                 "'touch_postgres' (fix or remove the row)"
             )
@@ -283,83 +291,6 @@ class SlugLease:
             touch_postgres=touch,
             reserved_at=str(data.get("reserved_at") or ""),
         )
-
-
-def _normalize_lease_entry(
-    key: str, val: object, *, default_op: LeaseOp
-) -> object:
-    """Normalize one lease value to the canonical object shape.
-
-    Single fence for every value under ``dropping`` and ``leases``:
-    coerce strings, invert ``skip_postgres`` (``touch_postgres`` wins when
-    both are present), ``setdefault("op", default_op)``. Non-dict/non-string
-    values pass through untouched so :meth:`SlugLease.from_dict` fails
-    closed as corrupt.
-    """
-    if isinstance(val, str):
-        return {
-            "lease_id": 0,
-            "op": default_op,
-            "worktrees": [val] if val else [],
-            "object_name": "",
-            "touch_postgres": True,
-        }
-    if not isinstance(val, dict):
-        return val
-    entry = dict(val)
-    legacy = False
-    if "skip_postgres" in entry:
-        legacy = True
-        skip = entry.pop("skip_postgres")
-        if "touch_postgres" not in entry:
-            entry["touch_postgres"] = not bool(skip)
-    if "op" not in entry:
-        legacy = True
-        entry["op"] = default_op
-    elif entry.get("op") not in ("provision", "drop"):
-        # Corrupt op — leave for from_dict to reject; not legacy.
-        return entry
-    if default_op == "drop" and "touch_postgres" not in entry and legacy:
-        # Dropping-sourced dicts without any touch signal default to a
-        # real Postgres drop (the only legacy drop semantic).
-        entry["touch_postgres"] = True
-    return entry
-
-
-def normalize_state_dict(raw: dict) -> dict:
-    """Single legacy fence: canonicalize ``dropping`` + ``leases`` in place.
-
-    Always folds ``dropping`` into ``leases`` (``leases`` wins on key
-    conflict), normalizes every lease value via
-    :func:`_normalize_lease_entry`, and pops ``dropping``. The canonical
-    form is persisted lazily by the next ``locked_state`` mutation, so
-    this stays a pure dict-to-dict transform with no persistence.
-    """
-    if not isinstance(raw, dict):
-        return raw
-    data = dict(raw)
-    raw_dropping = data.get("dropping")
-    if raw_dropping is not None and not isinstance(raw_dropping, dict):
-        raise SystemExit(
-            "corrupt state.json: 'dropping' must be an object"
-        )
-    raw_leases = data.get("leases")
-    if raw_leases is not None and not isinstance(raw_leases, dict):
-        raise SystemExit("corrupt state.json: 'leases' must be an object")
-    canonical: dict = {}
-    for k, v in (raw_leases or {}).items():
-        canonical[str(k)] = _normalize_lease_entry(
-            str(k), v, default_op="drop"
-        )
-    for k, v in (raw_dropping or {}).items():
-        if str(k) in canonical:
-            continue  # leases wins on key conflict
-        canonical[str(k)] = _normalize_lease_entry(
-            str(k), v, default_op="drop"
-        )
-    data["leases"] = canonical
-    data.pop("dropping", None)
-    return data
 
 
 @dataclass
@@ -385,19 +316,34 @@ class PluginState:
 
     @classmethod
     def from_dict(cls, data: dict) -> PluginState:
-        data = normalize_state_dict(data)
+        """Parse the canonical 0.1.0 schema (strict, no legacy migration).
+
+        Pre-0.1.0 shapes (``dropping``, string leases, ``skip_postgres``,
+        missing ``op``) fail closed as corrupt: for an official publish the
+        dual-schema tax on every load costs more than a one-time manual
+        fix of dev-era state files.
+        """
+        if "dropping" in data:
+            raise CorruptStateError(
+                "corrupt state.json: 'dropping' is a pre-0.1.0 key "
+                "(canonical schema uses 'leases'); rename it to 'leases' "
+                "with an 'op: drop' + 'touch_postgres' per entry, or "
+                "remove it — refusing to guess"
+            )
         raw = data.get("worktrees") or {}
         if not isinstance(raw, dict):
-            raise SystemExit("corrupt state.json: 'worktrees' must be an object")
+            raise CorruptStateError(
+                "corrupt state.json: 'worktrees' must be an object"
+            )
         worktrees: dict[str, WorktreeRecord] = {}
         by_key: dict[str, str] = {}
         for path, rec in raw.items():
             if not isinstance(rec, dict):
-                raise SystemExit(
+                raise CorruptStateError(
                     f"corrupt state.json: worktree {path!r} is not an object"
                 )
             if not rec.get("key"):
-                raise SystemExit(
+                raise CorruptStateError(
                     f"corrupt state.json: worktree {path!r} missing 'key' "
                     "(fix or remove the row)"
                 )
@@ -405,27 +351,29 @@ class PluginState:
             record = WorktreeRecord.from_dict(rec)
             holder = by_key.get(record.key)
             if holder is not None:
-                raise SystemExit(
+                raise CorruptStateError(
                     f"corrupt state.json: key {record.key!r} claimed by both "
                     f"{holder!r} and {path_s!r}; drop/forget one row "
                     "(one key → one path)"
                 )
             by_key[record.key] = path_s
             worktrees[path_s] = record
-        # Legacy ``dropping`` already migrated above; only ``leases`` remains.
-        raw_leases = data.get("leases") or {}
-        if raw_leases and not isinstance(raw_leases, dict):
-            raise SystemExit(
+        # Only ``leases`` remains — no ``dropping`` merge, no soft defaults.
+        raw_leases = data.get("leases")
+        if raw_leases is None:
+            raw_leases = {}
+        if not isinstance(raw_leases, dict):
+            raise CorruptStateError(
                 "corrupt state.json: 'leases' must be an object"
             )
         leases = {
             str(k): SlugLease.from_dict(str(k), v)
-            for k, v in (raw_leases or {}).items()
+            for k, v in raw_leases.items()
         }
         try:
             next_id = int(data.get("next_lease_id") or 1)
         except (TypeError, ValueError) as exc:
-            raise SystemExit(
+            raise CorruptStateError(
                 "corrupt state.json: next_lease_id must be an integer"
             ) from exc
         if next_id < 1:

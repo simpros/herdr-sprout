@@ -10,7 +10,7 @@ from sprout_worktree_db.drop import execute_drop_lease
 from sprout_worktree_db.gitutil import git_worktree_paths, run
 from sprout_worktree_db.keys import key_from_object, postgres_target
 from sprout_worktree_db.leases import reserve_from_plan
-from sprout_worktree_db.models import DropOp, PluginConfig, PluginState, Secrets, SlugLease
+from sprout_worktree_db.models import DropOp, PluginConfig, PluginState, Secrets, SlugLease, WorktreeRecord
 from sprout_worktree_db.paths import log, require_admin_url
 from sprout_worktree_db.state import (
     expired_lease_keys,
@@ -30,6 +30,28 @@ def live_worktree_paths_for_config(cfg: PluginConfig) -> set[str]:
     return live
 
 
+def holds_postgres_object(
+    rec: WorktreeRecord, lease: SlugLease | None
+) -> str | None:
+    """Object name GC must treat as live for this claim, or None.
+
+    Named cases (previously one nested ``not (A and B)`` boolean):
+
+    - drop lease: the slug is held only; ``touch_postgres`` objects are
+      counted from the lease loop in :func:`live_objects_from_state`, so
+      the claim contributes nothing here.
+    - provision lease before finalize (empty object): slug only, nothing live.
+    - provision lease after finalize: the object is real — live.
+    - no lease: live when the claim is Postgres-backed.
+    """
+    if lease is not None and lease.op != "provision":
+        return None
+    if lease is not None and not rec.object:
+        return None
+    obj, touch = postgres_target(rec, rec.key)
+    return obj if touch and obj else None
+
+
 def live_objects_from_state(
     state: PluginState, live_paths: set[str]
 ) -> set[str]:
@@ -45,16 +67,8 @@ def live_objects_from_state(
         real = os.path.realpath(path) if path else ""
         if not (os.path.exists(path) or real in live_paths):
             continue
-        lease = state.leases.get(rec.key)
-        if lease is not None and not (
-            lease.op == "provision" and rec.object
-        ):
-            # Drop leases (and pre-finalize provision rows with no object
-            # yet) hold the slug only — touch_postgres drop leases are
-            # counted live via the lease loop below.
-            continue
-        obj, touch = postgres_target(rec, rec.key)
-        if touch and obj:
+        obj = holds_postgres_object(rec, state.leases.get(rec.key))
+        if obj:
             live.add(obj)
     for key, res in state.leases.items():
         if res.op != "drop" or not res.touch_postgres:

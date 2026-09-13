@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Iterator
 
+from sprout_worktree_db.errors import BusyError, ConfigError
 from sprout_worktree_db.gitutil import repo_config
 from sprout_worktree_db.keys import (
     mint_key,
@@ -27,7 +28,6 @@ from sprout_worktree_db.keys import (
 )
 from sprout_worktree_db.models import (
     DropOp,
-    LeaseOp,
     Mode,
     PluginConfig,
     PluginState,
@@ -60,23 +60,44 @@ def _forget_set(
     return tuple(dict.fromkeys(p for p in (claim, *extra) if p))
 
 
-def _mint_lease(
+def _mint_provision_lease(
     state: PluginState,
     key: str,
     *,
-    op: LeaseOp,
+    worktrees: tuple[str, ...],
+) -> SlugLease:
+    """Mint a provision lease (no forget-set: the claim row is the set)."""
+    lease_id = state.next_lease_id
+    state.next_lease_id = lease_id + 1
+    lease = SlugLease(
+        lease_id=lease_id,
+        key=key,
+        op="provision",
+        worktrees=worktrees,
+        object_name="",
+        touch_postgres=False,
+        reserved_at=_now_iso(),
+    )
+    state.leases[key] = lease
+    return lease
+
+
+def _mint_drop_lease(
+    state: PluginState,
+    key: str,
+    *,
     worktrees: tuple[str, ...],
     object_name: str,
     touch_postgres: bool,
 ) -> SlugLease:
+    """Mint a drop lease (drop-only forget-set: claim path + remint extras)."""
     lease_id = state.next_lease_id
     state.next_lease_id = lease_id + 1
-    forget = _forget_set(state, key, worktrees) if op == "drop" else worktrees
     lease = SlugLease(
         lease_id=lease_id,
         key=key,
-        op=op,
-        worktrees=forget,
+        op="drop",
+        worktrees=_forget_set(state, key, worktrees),
         object_name=object_name,
         touch_postgres=touch_postgres,
         reserved_at=_now_iso(),
@@ -91,11 +112,14 @@ def _claim_key(
     *,
     mode: Mode,
     requested: str | None = None,
-) -> tuple[str, int]:
+) -> tuple[str, int, str]:
     """Atomically resolve + persist a provision lease before slow sprout work.
 
-    Returns ``(key, lease_id)``. Re-provision reuses the stored key so
-    passwords/objects stay stable. One key maps to at most one worktree path.
+    Returns ``(key, lease_id, prior_object)``. Re-provision reuses the stored
+    key so passwords/objects stay stable. One key maps to at most one
+    worktree path. ``prior_object`` is the pre-claim object (``""`` for a
+    fresh claim) so provision can best-effort clean an orphaned dedicated
+    DB only when this run created it — never a live DB that predates us.
 
     Claim reserves the key under an exclusive provision lease. On re-claim the
     existing row is left untouched until finalization writes mode/object.
@@ -106,15 +130,15 @@ def _claim_key(
         reclaim_expired_leases(state)
         previous = state.worktrees.get(worktree)
         if previous and previous.key in state.leases:
-            raise SystemExit(_busy_msg(previous.key, state.leases[previous.key]))
+            raise BusyError(_busy_msg(previous.key, state.leases[previous.key]))
         if previous is not None and previous.mode != mode:
-            raise SystemExit(
+            raise BusyError(
                 f"{worktree} is {previous.mode}; "
                 f"drop first, then re-run for {mode}"
             )
         key = resolve_key(state, worktree, repo, requested)
         if key in state.leases:
-            raise SystemExit(_busy_msg(key, state.leases[key]))
+            raise BusyError(_busy_msg(key, state.leases[key]))
         holder = next(
             (
                 p
@@ -124,10 +148,11 @@ def _claim_key(
             None,
         )
         if holder:
-            raise SystemExit(
+            raise BusyError(
                 f"key {key!r} already claimed by {holder}; "
                 "drop that worktree first"
             )
+        prior_object = previous.object if previous is not None else ""
         if previous is None:
             state.worktrees[worktree] = WorktreeRecord(
                 key=key,
@@ -136,15 +161,12 @@ def _claim_key(
                 object="",
                 created_at=_now_iso(),
             )
-        lease = _mint_lease(
+        lease = _mint_provision_lease(
             state,
             key,
-            op="provision",
             worktrees=(worktree,),
-            object_name="",
-            touch_postgres=False,
         )
-        return key, lease.lease_id
+        return key, lease.lease_id, prior_object
 
 
 def _provision_lease_valid(
@@ -214,12 +236,14 @@ class ProvisionLease:
             lease.record_steps(steps)
 
     ``__exit__`` always clears the provision lease; the claim row is kept
-    either way.
+    either way. ``prior_object`` is the object that predated this claim
+    (``""`` when fresh) — provision uses it to scope orphan cleanup.
     """
 
     worktree: str
     key: str
     lease_id: int
+    prior_object: str = ""
 
     def finalize(self, record: WorktreeRecord) -> None:
         _finalize_claim(self.worktree, self.key, self.lease_id, record)
@@ -240,9 +264,16 @@ def claim_provision(
     requested: str | None = None,
 ) -> Iterator[ProvisionLease]:
     """Claim a provision lease and yield a session handle (always released)."""
-    key, lease_id = _claim_key(worktree, repo, mode=mode, requested=requested)
+    key, lease_id, prior_object = _claim_key(
+        worktree, repo, mode=mode, requested=requested
+    )
     try:
-        yield ProvisionLease(worktree=worktree, key=key, lease_id=lease_id)
+        yield ProvisionLease(
+            worktree=worktree,
+            key=key,
+            lease_id=lease_id,
+            prior_object=prior_object,
+        )
     finally:
         _pop_provision_lease(key, lease_id)
 
@@ -286,10 +317,9 @@ def _reserve(
         stolen = state.leases.pop(key, None)
         if stolen:
             log(f"stole drop lease for {key!r}")
-    return _mint_lease(
+    return _mint_drop_lease(
         state,
         key,
-        op="drop",
         worktrees=worktrees,
         object_name=object_name,
         touch_postgres=touch_postgres,
@@ -298,18 +328,21 @@ def _reserve(
 
 def _drop_target(
     state: PluginState,
-    cfg: PluginConfig,
-    worktree: str | None,
-    requested: str | None,
     *,
+    worktree: str | None,
+    requested_key: str | None,
+    remint_key: str | None,
     forget_only: bool = False,
 ) -> DropOp:
     """Resolve drop identity: by --key, by worktree row, or remint recovery.
 
-    ``forget_only`` is encoded here, once, as ``touch_postgres=False`` — the
-    op owns the flag from creation; no caller overrides it afterwards.
+    Pure state lookup — no I/O. Remint inputs (``remint_key``) are resolved
+    by the caller *before* taking the lock because ``repo_config`` runs
+    ``git worktree list``. ``forget_only`` is encoded here, once, as
+    ``touch_postgres=False`` — the op owns the flag from creation; no
+    caller overrides it afterwards.
     """
-    wt = os.path.realpath(worktree) if worktree else None
+    wt = worktree
 
     def _bake(key: str, obj: str, touch: bool, paths: tuple[str, ...]) -> DropOp:
         return DropOp(
@@ -319,39 +352,34 @@ def _drop_target(
             paths=paths,
         )
 
-    if requested:
-        key = normalize_key(requested)
-        if not key:
-            raise SystemExit(f"invalid --key: {requested!r}")
-        path = path_for_key(state, key)
+    if requested_key is not None:
+        path = path_for_key(state, requested_key)
         rec = state.worktrees[path] if path else None
-        obj, touch = postgres_target(rec, key)
-        return _bake(key, obj, touch, (wt,) if wt else ())
+        obj, touch = postgres_target(rec, requested_key)
+        return _bake(requested_key, obj, touch, (wt,) if wt else ())
 
-    if wt:
+    if wt is not None:
         record = state.worktrees.get(wt)
         if record:
             obj, touch = postgres_target(record, record.key)
             return _bake(record.key, obj, touch, (wt,))
-        repo = repo_config(cfg, wt)
-        if repo:
-            key = mint_key(wt, repo)
-            obj, touch = postgres_target(None, key)
-            return _bake(key, obj, touch, (wt,))
-        raise SystemExit(
+        if remint_key is not None:
+            obj, touch = postgres_target(None, remint_key)
+            return _bake(remint_key, obj, touch, (wt,))
+        raise ConfigError(
             f"no state row for {wt}; pass --key "
             "(or ensure repo config matches so the slug can be reminted)"
         )
 
-    raise SystemExit("drop needs --worktree or --key")
+    raise ConfigError("drop needs --worktree or --key")
 
 
 def _resolve_and_reserve(
     state: PluginState,
-    cfg: PluginConfig,
-    worktree: str | None,
-    requested: str | None,
     *,
+    worktree: str | None,
+    requested_key: str | None,
+    remint_key: str | None,
     forget_only: bool = False,
     steal: bool = False,
 ) -> SlugLease:
@@ -361,7 +389,11 @@ def _resolve_and_reserve(
     is no override side channel.
     """
     t = _drop_target(
-        state, cfg, worktree, requested, forget_only=forget_only
+        state,
+        worktree=worktree,
+        requested_key=requested_key,
+        remint_key=remint_key,
+        forget_only=forget_only,
     )
     lease = _reserve(
         state,
@@ -372,10 +404,9 @@ def _resolve_and_reserve(
         steal=steal,
     )
     if lease is None:
-        existing = state.leases.get(t.key)
-        if existing:
-            raise SystemExit(_busy_msg(t.key, existing))
-        raise SystemExit(f"key {t.key!r}: drop in progress")
+        # _reserve only refuses while a lease holds the slug, so the row
+        # must still be there — no second fallback raise.
+        raise BusyError(_busy_msg(t.key, state.leases[t.key]))
     return lease
 
 
@@ -393,15 +424,34 @@ def begin_drop(
     reclaim), so remint recovery works without guessing keys up front.
     Provision leases are not stolen — use TTL or ``gc --reclaim-leases``.
     ``forget_only`` encodes ``touch_postgres=False`` on the lease.
+
+    Remint inputs are resolved *before* the lock: ``repo_config`` shells
+    out to ``git worktree list``, which must never run while holding the
+    exclusive state flock (a hung git would stall every other writer).
+    ``_drop_target`` under the lock is then a pure state lookup; a row
+    created concurrently still wins because the lock re-checks state.
     """
+    wt = os.path.realpath(worktree) if worktree else None
+    requested_key: str | None = None
+    if requested is not None:
+        requested_key = normalize_key(requested)
+        if not requested_key:
+            raise ConfigError(f"invalid --key: {requested!r}")
+    if wt is None and requested_key is None:
+        raise ConfigError("drop needs --worktree or --key")
+    remint_key: str | None = None
+    if wt is not None and requested_key is None:
+        repo = repo_config(cfg, wt)
+        if repo is not None:
+            remint_key = mint_key(wt, repo)
     with locked_state() as state:
         for key in reclaim_expired_leases(state):
             log(f"reclaimed expired lease for {key!r}")
         return _resolve_and_reserve(
             state,
-            cfg,
-            worktree,
-            requested,
+            worktree=wt,
+            requested_key=requested_key,
+            remint_key=remint_key,
             forget_only=forget_only,
             steal=force,
         )
@@ -428,10 +478,17 @@ def reserve_from_plan(state: PluginState, plan: DropOp) -> SlugLease | None:
 def _clear_lease(
     state: PluginState, lease: SlugLease, *, restore: bool
 ) -> None:
+    """Fenced clear of a *drop* lease.
+
+    ``finish_drop`` (``restore=False``) also pops the claim; ``abort_drop``
+    (``restore=True``) keeps it. No ``op`` branch: every lease cleared here
+    is a drop lease by construction (provision leases pop via
+    ``_pop_provision_lease``).
+    """
     reserved = state.leases.get(lease.key)
     if reserved is None or reserved.lease_id != lease.lease_id:
         return
-    if not restore and lease.op == "drop":
+    if not restore:
         for path in reserved.worktrees:
             state.worktrees.pop(path, None)
     state.leases.pop(lease.key, None)

@@ -12,6 +12,7 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from sprout_worktree_db.errors import BusyError, ConfigError
 from sprout_worktree_db.models import RepoConfig, WorktreeRecord
 
 if TYPE_CHECKING:
@@ -69,7 +70,7 @@ def mint_key(worktree: str, repo: RepoConfig) -> str:
     else:
         base = basename or repo_slug
     if not base:
-        raise SystemExit(f"cannot derive slug from worktree path: {worktree}")
+        raise ConfigError(f"cannot derive slug from worktree path: {worktree}")
     suffix = stable_suffix(worktree)
     # Reserve 6 chars for "-xxxxx"; truncate base so the full key fits in 40.
     key = f"{base[:34]}-{suffix}"
@@ -90,7 +91,7 @@ def resolve_key(
         if requested:
             normalized = normalize_key(requested)
             if requested != existing.key and normalized != existing.key:
-                raise SystemExit(
+                raise BusyError(
                     f"{worktree} already claimed as {existing.key!r}; "
                     f"drop/forget first, or omit --key (got {requested!r})"
                 )
@@ -98,6 +99,6 @@ def resolve_key(
     if requested:
         key = normalize_key(requested)
         if not key:
-            raise SystemExit(f"invalid --key: {requested!r}")
+            raise ConfigError(f"invalid --key: {requested!r}")
         return key
     return mint_key(worktree, repo)

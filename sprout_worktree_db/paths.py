@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from sprout_worktree_db import PLUGIN_ID
+from sprout_worktree_db.errors import ConfigError
 from sprout_worktree_db.models import PluginConfig
 
 LEGACY_CONFIG_DIR = Path.home() / ".config" / "sprout"
@@ -111,7 +112,7 @@ def log(msg: str) -> None:
 def load_config() -> PluginConfig:
     path = config_path()
     if not path.exists():
-        raise SystemExit(
+        raise ConfigError(
             f"missing config {config_dir() / 'config.json'} "
             f"(see README; herdr plugin config-dir {PLUGIN_ID})"
         )
@@ -137,7 +138,7 @@ def load_secrets() -> dict[str, str]:
 def require_admin_url(secrets: dict[str, str]) -> str:
     url = secrets.get("SPROUT_WORKTREE_ADMIN_URL", "").strip()
     if not url:
-        raise SystemExit(
+        raise ConfigError(
             f"SPROUT_WORKTREE_ADMIN_URL missing in {secrets_path()} "
             "(CREATEROLE admin DSN required)"
         )
