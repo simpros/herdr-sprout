@@ -1,0 +1,24 @@
+{
+  "cli": "sprout",
+  "bun": "bun",
+  "auto_provision_on_create": false,
+  "repos": [
+    {
+      "name": "example",
+      "main_repo": "~/repositories/example",
+      "worktrees_root": "~/.herdr/worktrees/example",
+      "canonical_repo_id": "https://github.com/example/example",
+      "forge": "github",
+      "env_files": [".env"],
+      "requires_node_modules": false,
+      "renames": {
+        "PGHOST": "DATABASE_HOST",
+        "PGPORT": "DATABASE_PORT",
+        "PGDATABASE": "DATABASE_NAME",
+        "PGUSER": "DATABASE_USER",
+        "PGPASSWORD": "DATABASE_PASSWORD"
+      },
+      "steps": []
+    }
+  ]
+}

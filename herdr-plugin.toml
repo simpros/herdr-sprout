@@ -1,0 +1,47 @@
+id = "sprout.worktree-db"
+name = "Sprout worktree DB"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+description = "Provision a dedicated Postgres database per herdr worktree (via sprout worktree-db) and drop it on remove"
+platforms = ["linux", "macos"]
+
+# worktree.created is a no-op unless config.auto_provision_on_create is true.
+# When another plugin copies .env files, leave that false and wire the
+# `provision` action as an ordered step *after* those copies (see README).
+[[events]]
+on = "worktree.created"
+command = ["python3", "bin/sprout-worktree-db", "hook", "created"]
+
+[[events]]
+on = "worktree.removed"
+command = ["python3", "bin/sprout-worktree-db", "hook", "removed"]
+
+[[actions]]
+id = "provision"
+title = "Sprout: provision worktree database"
+contexts = ["workspace"]
+command = ["python3", "bin/sprout-worktree-db", "action", "provision"]
+
+[[actions]]
+id = "drop"
+title = "Sprout: drop worktree database"
+contexts = ["workspace"]
+command = ["python3", "bin/sprout-worktree-db", "action", "drop"]
+
+[[actions]]
+id = "gc"
+title = "Sprout: garbage-collect orphan worktree databases"
+contexts = ["workspace"]
+command = ["python3", "bin/sprout-worktree-db", "gc"]
+
+[[actions]]
+id = "status"
+title = "Sprout: list worktree databases"
+contexts = ["workspace"]
+command = ["python3", "bin/sprout-worktree-db", "status"]
+
+[[actions]]
+id = "attach-preview"
+title = "Sprout: attach worktree to PR/MR preview database"
+contexts = ["workspace"]
+command = ["python3", "bin/sprout-worktree-db", "action", "attach-preview"]
