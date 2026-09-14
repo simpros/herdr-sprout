@@ -210,3 +210,8 @@ python3 -m unittest discover -s test -v
 ```
 
 Package layout: `sprout_worktree_db/` (library) + `bin/sprout-worktree-db` (thin shim).
+
+## License
+
+Licensed under the GNU Affero General Public License v3.0 only
+(SPDX: `AGPL-3.0-only`). See [LICENSE](LICENSE).

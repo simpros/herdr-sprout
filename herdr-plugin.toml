@@ -3,6 +3,7 @@ name = "Sprout worktree DB"
 version = "0.1.0"
 min_herdr_version = "0.8.0"
 description = "Provision a dedicated Postgres database per herdr worktree (via sprout worktree-db) and drop it on remove"
+license = "AGPL-3.0-only"
 platforms = ["linux", "macos"]
 
 # worktree.created is a no-op unless config.auto_provision_on_create is true.
