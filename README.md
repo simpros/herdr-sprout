@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/sprout-mark.png" width="132" alt="sprout">
+</p>
+
 # herdr-sprout
 
 Official [herdr](https://herdr.dev) plugin for [sprout](https://github.com/simpros/sprout):
